@@ -1,0 +1,13 @@
+# chat.scn: personal messaging alone (TCP, WebSocket push), with replica churn.
+# Figures for one LB instance: 500 k concurrent flows, mean lifetime 1 h
+# (Little's law: about 140 new flows/s), a keepalive every 60 s, an event every 2 min.
+duration 15min
+warmup 66
+
+service chat
+  vip 198.51.100.10 port 443 proto tcp
+  replicas 64 10.1.0.1
+  model chat flows=500k lifetime=1h keepalive=60 event_interval=2min reconnect=10
+  upgrade start=150 interval=60 drain=40 groups=8     # one eighth at a time: drained, removed, replaced
+  failures rate=1/min repair=2min                     # a failed replica's clients reconnect within 10 s
+  scale_out at=700 add=25%

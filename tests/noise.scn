@@ -1,0 +1,14 @@
+# noise: frames that belong to no service are all dropped, none is forwarded; service traffic is not dropped
+# expect none,misforwarded = 0
+# expect none,pkts_dropped = none,pkts_rx
+# expect none,pkts_rx > 1000
+# expect web,pkts_dropped = 0
+# expect all,malformed = 0
+# expect run,leaks = 0
+duration 20
+warmup 5
+service web
+  vip 198.51.100.30 port 443 proto tcp
+  replicas 8 10.3.0.1
+  model web flows=200
+noise arp=20 nd=20 lldp=5 bgp=5 bfd=20 scan=50 ping=20 udp=50

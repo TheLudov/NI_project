@@ -1,0 +1,14 @@
+# web.scn: web and API traffic alone (TCP, short connections), with replica churn.
+# 5 k concurrent flows, median lifetime 300 ms (about 10 k new flows/s), 8 to 30 packets per flow.
+duration 10min
+warmup 66
+
+service web
+  vip 198.51.100.30 port 443 proto tcp
+  replicas 48 10.3.0.1
+  model web flows=5000 lifetime_median=300ms h1_share=0.3
+  upgrade start=120 interval=40 drain=20 groups=8
+  failures rate=1/min repair=2min
+  scale_out at=480 add=25%
+
+noise arp=10 nd=10 lldp=0.5 bgp=0.1 bfd=20 scan=50 ping=20 udp=50

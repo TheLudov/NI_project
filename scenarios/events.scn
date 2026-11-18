@@ -1,0 +1,12 @@
+# events.scn: the event-cost experiment: one service with 500 replicas and a high rate of replica events
+# (rolling upgrade, frequent failures with repair, a scale-out), moderate traffic.
+duration 5min
+warmup 66
+
+service web
+  vip 198.51.100.30 port 443 proto tcp
+  replicas 500 10.3.0.1
+  model web flows=2000 lifetime_median=300ms
+  upgrade start=90 interval=10 drain=5 groups=8
+  failures rate=2/s repair=20
+  scale_out at=240 add=25%

@@ -1,0 +1,12 @@
+# video.scn: video streaming alone (TCP, ON/OFF segment downloads), with replica churn.
+# 2.5 k concurrent flows, median lifetime 8 min (about 5 new flows/s), 200 packets/s per flow on average.
+duration 10min
+warmup 66
+
+service video
+  vip 198.51.100.20 port 443 proto tcp
+  replicas 32 10.2.0.1
+  model video flows=2500 lifetime_median=8min segment=4 on_share=0.25 pps=200
+  upgrade start=120 interval=40 drain=20 groups=8
+  failures rate=1/min repair=2min
+  scale_out at=480 add=25%

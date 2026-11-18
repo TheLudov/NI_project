@@ -1,0 +1,33 @@
+# mixed.scn: the three services together, with replica churn and LB-tier churn.
+# The LB join comes before any replica change, the LB leave after the upgrades.
+duration 10min
+warmup 66
+
+service chat
+  vip 198.51.100.10 port 443 proto tcp
+  replicas 64 10.1.0.1
+  model chat flows=500k lifetime=1h
+  upgrade start=150 interval=40 drain=25 groups=8
+  failures rate=1/min repair=2min
+  scale_out at=480 add=25%
+
+service video
+  vip 198.51.100.20 port 443 proto tcp
+  replicas 32 10.2.0.1
+  model video flows=2500 lifetime_median=8min
+  upgrade start=160 interval=40 drain=20 groups=8
+  failures rate=1/min repair=2min
+  scale_out at=490 add=25%
+
+service web
+  vip 198.51.100.30 port 443 proto tcp
+  replicas 48 10.3.0.1
+  model web flows=5000 lifetime_median=300ms
+  upgrade start=170 interval=40 drain=20 groups=8
+  failures rate=1/min repair=2min
+  scale_out at=500 add=25%
+
+lb join at=100 fraction=0.2
+lb leave at=540 fraction=0.25
+
+noise arp=10 nd=10 lldp=0.5 bgp=0.1 bfd=20 scan=50 ping=20 udp=50

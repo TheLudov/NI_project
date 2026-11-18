@@ -1,0 +1,29 @@
+# churn: replica churn alone (drains, removals, additions, failures, a scale-out, after the warm-up) breaks no flow
+# and sends no new flow to a draining or dead replica (once the LB is told)
+# expect all,broken_flows = 0
+# expect all,misplaced_flows = 0
+# expect all,malformed = 0
+# expect run,leaks = 0
+# expect run,events_delivered = run,events
+# expect all,lost_flows > 0
+duration 60
+warmup 12
+health_delay 2
+service chat
+  vip 198.51.100.10 port 443 proto tcp
+  replicas 16 10.1.0.1
+  model chat flows=500 lifetime=5min keepalive=10 event_interval=20 reconnect=3
+  upgrade start=15 interval=4 drain=2 groups=8
+  failures rate=4/min repair=10
+  scale_out at=50 add=25%
+service web
+  vip 198.51.100.30 port 443 proto tcp
+  replicas 12 10.3.0.1
+  model web flows=200
+  upgrade start=16 interval=4 drain=2 groups=8
+  scale_out at=48 add=25%
+  # explicit events (no random failures on this service: they could make these meaningless)
+  event 20 add 10.3.0.200
+  event 30 drain 10.3.0.200
+  event 40 up 10.3.0.200
+  event 44 down 10.3.0.200

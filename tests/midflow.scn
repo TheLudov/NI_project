@@ -1,0 +1,16 @@
+# midflow: flows in progress at time 0 come mid-flow (no SYN); your LB must send them where its copy (the other LB
+# instances) sent their first packet: compute_replica must work without lookup, and give the same answer
+# expect all,copy_failures = 0
+# expect all,broken_flows = 0
+# expect all,misplaced_flows = 0
+# expect chat,flows_midflow = 300
+duration 30
+warmup 12
+service chat
+  vip 198.51.100.10 port 443 proto tcp
+  replicas 16 10.1.0.1
+  model chat flows=300 lifetime=5min keepalive=10 event_interval=20
+service web
+  vip 198.51.100.30 port 443 proto tcp
+  replicas 8 10.3.0.1
+  model web flows=100

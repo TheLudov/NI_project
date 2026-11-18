@@ -1,0 +1,14 @@
+# bonus: web in a two-way tunnel: replies arrive encapsulated on the internal NIC; send them decapsulated on the
+# external NIC (Ethernet from ext_mac to border_mac)
+# params web_tunnel=1
+# bonus
+# expect web,replies_fwd = web,replies_rx
+# expect web,replies_rx > 1000
+# expect web,replies_malformed = 0
+# expect all,malformed = 0
+duration 20
+warmup 5
+service web
+  vip 198.51.100.30 port 443 proto tcp
+  replicas 8 10.3.0.1
+  model web flows=200

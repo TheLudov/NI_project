@@ -1,0 +1,17 @@
+# failover: a replica fails at 15 s (the LB is told at 17 s), another is drained at 25 s and removed at 35 s; new flows
+# must avoid the failed replica once the LB knows, and the draining one at once; their clients' flows are lost
+# expect all,misplaced_flows = 0
+# expect all,broken_flows = 0
+# expect web,lost_flows > 0
+# expect web,syn_retransmissions > 0
+# expect web,syn_giveups = 0
+duration 45
+warmup 5
+health_delay 2
+service web
+  vip 198.51.100.30 port 443 proto tcp
+  replicas 6 10.3.0.1
+  model web flows=300 lifetime_median=2 lifetime_sigma=0.5
+  event 15 down 10.3.0.2
+  event 25 drain 10.3.0.4
+  event 35 remove 10.3.0.4

@@ -1,0 +1,18 @@
+# frames: every frame the LB sends is well formed, no packet is leaked or sent twice
+# expect all,malformed = 0
+# expect run,leaks = 0
+# expect run,errors_sent_twice = 0
+# expect run,errors_not_owned = 0
+# expect run,errors_stage_mask = 0
+# expect all,pkts_dropped = 0
+# expect all,pkts_tx = all,pkts_rx
+duration 20
+warmup 5
+service web
+  vip 198.51.100.30 port 443 proto tcp
+  replicas 8 10.3.0.1
+  model web flows=300
+service video
+  vip 198.51.100.20 port 443 proto tcp
+  replicas 4 10.2.0.1
+  model video flows=20 lifetime_median=10 segment=2 pps=50
