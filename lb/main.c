@@ -15,16 +15,27 @@
  * them too.  README.md documents the harness.
  */
 #include <stdio.h>
+#include <string.h>
 
 #include "gen.h"
 
-struct lb { int unused; };
+struct lb {
+    gen_config_t cfg; // copy of gen_config_t
+    // TODO: define flow table, hash table
+};
 struct pkt_state { int unused; };
 
 static lb_t *init(gen_t *g, const gen_config_t *cfg)
 {
-    (void)cfg;
-    return gen_alloc(g, sizeof(lb_t), 0, 0);
+    lb_t *lb = gen_alloc(g, sizeof(lb_t), 0, 0);
+    if (!lb) {
+        fprintf(stderr, "gen_alloc for LB failed\n");
+        return NULL;
+    }
+    lb->cfg = *cfg;
+    // (void)cfg;
+    // return gen_alloc(g, sizeof(lb_t), 0, 0);
+    return lb;
 }
 
 static void hash(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, uint64_t mask)
