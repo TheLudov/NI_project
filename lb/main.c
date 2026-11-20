@@ -18,12 +18,17 @@
 #include <string.h>
 
 #include "gen.h"
+#include "parser.h"
+#include "crc32c.h"
 
 struct lb {
     gen_config_t cfg; // copy of gen_config_t
     // TODO: define flow table, hash table
 };
-struct pkt_state { int unused; };
+struct pkt_state {
+    uint32_t hash; // flow hash
+    uint32_t replica; // replica chose by `compute_replica`
+};
 
 static lb_t *init(gen_t *g, const gen_config_t *cfg)
 {
@@ -39,6 +44,58 @@ static lb_t *init(gen_t *g, const gen_config_t *cfg)
 }
 
 static void hash(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, uint64_t mask)
+{
+    /* Parse the packets*/
+    for (int i = 0; i < n; i++) {
+        if (!(mask & (1ull << i))) {
+            continue;
+        }
+        const uint8_t *f = p[i]->buf + p[i]->off;
+        uint16_t len = p[i]->len;
+        if (len <= 47) {
+            // Not a service
+            return;
+        }
+
+        uint16_t e_type = rd16(f + 12);
+        uint8_t version = f[14];
+        if (e_type != 0x0800) {
+            // Not a service
+            return;
+        }
+
+        uint8_t protocol = f[23];
+        if (protocol != 6) {
+            // Not a service
+            return;
+        }
+        uint32_t s_ip = rd32(f + 26);
+        uint32_t d_ip = rd32(f + 30);
+        uint16_t s_port = rd16(f + 34);
+        uint16_t d_port = rd16(f+36);
+        uint8_t flag = f[47];
+
+        if (e_type == 0x08 && version == 0x45) {
+            uint64_t ips = (uint64_t)s_ip << 32 | d_ip;
+            uint64_t ports = (uint32_t)s_port << 16 | d_port;
+            uint32_t h = crc32c_u64(~0u, lb->cfg.seed);
+            h = crc32c_u64(h, ips);
+            h = crc32c_u32(h, ports);
+            h = crc32c_u8(h, protocol);
+
+            // Find packet services
+            for (uint32_t y = 0; y < lb->cfg.n_services; y++) {
+                service_t service = lb->cfg.services[y];
+                if (service.proto == protocol && service.vip == d_ip && service.port == d_port) {
+                    // Hash their flow
+                    s[i].hash = h;
+                }
+            }
+        }
+    }
+}
+
+static void lookup(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, uint64_t mask)
 {
     (void)lb; (void)p; (void)n; (void)s; (void)mask;
 }
@@ -59,7 +116,7 @@ static const lb_ops_t ops = {
     .state_size = sizeof(pkt_state_t),
     .init = init,
     .hash = hash,
-    .lookup = nothing,
+    .lookup = lookup,
     .compute_replica = nothing,
     .insert = nothing,
     .replica_of = replica_of,
