@@ -62,8 +62,22 @@ int main(int argc, char **argv)
     }
     gen_t *g = gen_open(argv[1], argc > 2 ? argv[2] : "", &ops);
     if (!g) return 1;
+    lb_t *lb =gen_lb(g);
     pkt_t *p[64];
+    pkt_state_t s[64];
     while (gen_running(g)) {
+        /* README version */
+        uint8_t n = gen_rx_batch(g, GEN_NIC_EXT, p, 64);
+        uint64_t all = n == 64 ? ~0ull : (1ull << n) - 1;
+        uint64_t ok = ...; /* the packets of a service; the other are dropped */
+        uint64_t hit = gen_lookup(g, lb, n, s, ok);
+        uint64_t got = gen_replica(g, lb, n, s, ok & ~hit);
+        gen_insert(g, lb, p, n, s, got); /* the new flow among them */
+        /* encapsulate hit | got, then: */
+        gen_tx_batch(g, GEN_NIC_INT, p, n, hit | got);
+        gen_drop(g, p, n, all & ~(hit | got));
+
+        /* Stub version */
         for (int nic = GEN_NIC_EXT; nic <= GEN_NIC_INT; nic++) {
             uint8_t n = gen_rx_batch(g, nic, p, 64);
             gen_drop(g, p, n, ~0ull);
