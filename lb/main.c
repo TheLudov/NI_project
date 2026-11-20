@@ -69,6 +69,7 @@ int main(int argc, char **argv)
         /* README version */
         uint8_t n = gen_rx_batch(g, GEN_NIC_EXT, p, 64);
         uint64_t all = n == 64 ? ~0ull : (1ull << n) - 1;
+        gen_hash(g, lb, p, n, s, all);
         uint64_t ok = ...; /* the packets of a service; the other are dropped */
         uint64_t hit = gen_lookup(g, lb, n, s, ok);
         uint64_t got = gen_replica(g, lb, n, s, ok & ~hit);
