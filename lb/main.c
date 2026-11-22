@@ -15,6 +15,7 @@
  * them too.  README.md documents the harness.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "gen.h"
@@ -24,8 +25,7 @@
 
 struct lb {
     gen_config_t cfg; // copy of gen_config_t
-    mg_service_t *sv;
-    uint32_t maglev_size;
+    mg_service_t *services;         /* one Maglev table per cfg.services[k] */
     // TODO: define flow table, hash table
 };
 struct pkt_state {
@@ -37,21 +37,41 @@ struct pkt_state {
     uint8_t valid;
 };
 
+static int is_prime(uint64_t m)
+{
+    if (m < 2) return 0;
+    for (uint64_t d = 2; d * d <= m; d++)
+        if (m % d == 0) return 0;
+    return 1;
+}
+
 static lb_t *init(gen_t *g, const gen_config_t *cfg)
 {
+    const char *param = gen_param(g, "maglev_size");
+    uint64_t size = param ? strtoull(param, NULL, 10) : 0;
+    if (size > UINT32_MAX || !is_prime(size)) {
+        fprintf(stderr, "maglev_size must be a prime below 2^32\n");
+        return NULL;
+    }
+
     lb_t *lb = gen_alloc(g, sizeof(lb_t), 0, 0);
     if (!lb) {
         fprintf(stderr, "gen_alloc for LB failed\n");
         return NULL;
     }
     lb->cfg = *cfg;
-    uint32_t maglev_size = rd32(gen_param(g, "maglev_size"));
-    if (!maglev_size) {
-        fprintf(stderr, "gen_param maglev_size failed\n");
+    lb->services = gen_alloc(g, (cfg->n_services ? cfg->n_services : 1) * sizeof *lb->services, 0, 0);
+    if (!lb->services) {
+        fprintf(stderr, "gen_alloc for services failed\n");
+        gen_mfree(g, lb);
         return NULL;
     }
-    lb->maglev_size = maglev_size;
-    mg_populate(lb->sv, lb->maglev_size);
+    for (uint32_t k = 0; k < cfg->n_services; k++) {
+        if (!mg_init(g, &lb->services[k], &cfg->services[k], (uint32_t)size, cfg->seed)) {
+            fprintf(stderr, "gen_alloc for maglev table failed\n");
+            return NULL;   /* the harness frees what was allocated */
+        }
+    }
     return lb;
 }
 
@@ -115,22 +135,18 @@ static uint64_t lookup(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, uint64_t 
 
 static uint64_t compute_replica(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, uint64_t mask)
 {
-    uint64_t ok;
+    (void)p;
+    uint64_t ok = 0;
     for (uint8_t i = 0; i < n; i++) {
-        if (!(mask & (1ull << i)))
+        if (!(mask & (1ull << i)) || !s[i].valid)
             continue;
-
-        const mg_service_t *sv = &lb->sv[s[i].service_id];
-        if (!s[i].valid || sv->n_active == 0) {
-            continue;
-        }
-        uint32_t slot = (uint32_t)(((uint64_t)s[i].hash * lb->maglev_size) >> 32);
-        s[i].replica = sv->rep[sv->table[slot]].ip;
+        uint32_t ip = mg_lookup(&lb->services[s[i].service_id], s[i].hash);
+        if (!ip)
+            continue;   /* no active replica */
+        s[i].replica = ip;
         ok |= 1ull << i;
     }
     return ok;
-    (void)lb; (void)p; (void)n; (void)s; (void)mask;
-    return 0;
 }
 
 static uint64_t nothing(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, uint64_t mask)
