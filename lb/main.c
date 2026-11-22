@@ -26,8 +26,9 @@ struct lb {
     // TODO: define flow table, hash table
 };
 struct pkt_state {
-    uint32_t hash; // flow hash
-    uint32_t replica; // replica chose by `compute_replica`
+    flow_key_t key;
+    uint32_t hash;
+    uint32_t replica;
     uint32_t service_id;
     uint8_t tcp_flags;
     uint8_t valid;
