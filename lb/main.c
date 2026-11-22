@@ -19,10 +19,13 @@
 
 #include "gen.h"
 #include "parser.h"
+#include "maglev.h"
 #include "crc32c.h"
 
 struct lb {
     gen_config_t cfg; // copy of gen_config_t
+    mg_service_t *sv;
+    uint32_t maglev_size;
     // TODO: define flow table, hash table
 };
 struct pkt_state {
@@ -42,8 +45,13 @@ static lb_t *init(gen_t *g, const gen_config_t *cfg)
         return NULL;
     }
     lb->cfg = *cfg;
-    // (void)cfg;
-    // return gen_alloc(g, sizeof(lb_t), 0, 0);
+    uint32_t maglev_size = rd32(gen_param(g, "maglev_size"));
+    if (!maglev_size) {
+        fprintf(stderr, "gen_param maglev_size failed\n");
+        return NULL;
+    }
+    lb->maglev_size = maglev_size;
+    mg_populate(lb->sv, lb->maglev_size);
     return lb;
 }
 
@@ -105,6 +113,26 @@ static uint64_t lookup(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, uint64_t 
     return 0;
 }
 
+static uint64_t compute_replica(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, uint64_t mask)
+{
+    uint64_t ok;
+    for (uint8_t i = 0; i < n; i++) {
+        if (!(mask & (1ull << i)))
+            continue;
+
+        const mg_service_t *sv = &lb->sv[s[i].service_id];
+        if (!s[i].valid || sv->n_active == 0) {
+            continue;
+        }
+        uint32_t slot = (uint32_t)(((uint64_t)s[i].hash * lb->maglev_size) >> 32);
+        s[i].replica = sv->rep[sv->table[slot]].ip;
+        ok |= 1ull << i;
+    }
+    return ok;
+    (void)lb; (void)p; (void)n; (void)s; (void)mask;
+    return 0;
+}
+
 static uint64_t nothing(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, uint64_t mask)
 {
     (void)lb; (void)p; (void)n; (void)s; (void)mask;
@@ -121,7 +149,7 @@ static const lb_ops_t ops = {
     .init = init,
     .hash = hash,
     .lookup = lookup,
-    .compute_replica = nothing,
+    .compute_replica = compute_replica,
     .insert = nothing,
     .replica_of = replica_of,
 };
