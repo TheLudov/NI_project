@@ -28,6 +28,9 @@ struct lb {
 struct pkt_state {
     uint32_t hash; // flow hash
     uint32_t replica; // replica chose by `compute_replica`
+    uint32_t service_id;
+    uint8_t tcp_flags;
+    uint8_t valid;
 };
 
 static lb_t *init(gen_t *g, const gen_config_t *cfg)
@@ -43,61 +46,62 @@ static lb_t *init(gen_t *g, const gen_config_t *cfg)
     return lb;
 }
 
-static void hash(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, uint64_t mask)
+/*Made By ludovick and next modify by samuel*/
+
+static void hash(lb_t *lb, pkt_t **p, uint8_t n,
+                 pkt_state_t *s, uint64_t mask)
 {
-    /* Parse the packets*/
-    for (int i = 0; i < n; i++) {
-        if (!(mask & (1ull << i))) {
+    for (uint8_t i = 0; i < n; i++) {
+        if (!(mask & (1ull << i)))
             continue;
-        }
+
+        // Initialize packet state
+        memset(&s[i], 0, sizeof(s[i]));
         const uint8_t *f = p[i]->buf + p[i]->off;
         uint16_t len = p[i]->len;
-        if (len <= 47) {
-            // Not a service
-            return;
-        }
 
-        uint16_t e_type = rd16(f + 12);
-        uint8_t version = f[14];
-        if (e_type != 0x0800) {
-            // Not a service
-            return;
-        }
+        // Parse Ethernet, IPv4 and TCP/UDP
+        if (!parse_flow(f, len, &s[i].key, &s[i].tcp_flags))
+            continue;
+        flow_key_t *key = &s[i].key;
 
-        uint8_t protocol = f[23];
-        if (protocol != 6) {
-            // Not a service
-            return;
-        }
-        uint32_t s_ip = rd32(f + 26);
-        uint32_t d_ip = rd32(f + 30);
-        uint16_t s_port = rd16(f + 34);
-        uint16_t d_port = rd16(f+36);
-        uint8_t flag = f[47];
+        // Find the corresponding service
+        for (uint32_t y = 0; y < lb->cfg.n_services; y++) {
 
-        if (e_type == 0x08 && version == 0x45) {
-            uint64_t ips = (uint64_t)s_ip << 32 | d_ip;
-            uint64_t ports = (uint32_t)s_port << 16 | d_port;
-            uint32_t h = crc32c_u64(~0u, lb->cfg.seed);
-            h = crc32c_u64(h, ips);
-            h = crc32c_u32(h, ports);
-            h = crc32c_u8(h, protocol);
+            service_t service = lb->cfg.services[y];
 
-            // Find packet services
-            for (uint32_t y = 0; y < lb->cfg.n_services; y++) {
-                service_t service = lb->cfg.services[y];
-                if (service.proto == protocol && service.vip == d_ip && service.port == d_port) {
-                    // Hash their flow
-                    s[i].hash = h;
-                }
+            if (service.proto == key->protocol && service.vip == key->dst_ip && service.port == key->dst_port) {
+                s[i].service_id = y;
+                s[i].valid = 1;
+                break;
             }
         }
+
+        if (!s[i].valid)
+            continue;
+        // Compute CRC32C hash of the 5-tuple
+        uint64_t ips = ((uint64_t)key->src_ip << 32) | key->dst_ip;
+        uint32_t ports = ((uint32_t)key->src_port << 16) | key->dst_port;
+
+        uint32_t h = crc32c_u64(~0u, lb->cfg.seed);
+        h = crc32c_u64(h, ips);
+        h = crc32c_u32(h, ports);
+        h = crc32c_u8(h, key->protocol);
+
+        s[i].hash = h;
     }
 }
 
-static void lookup(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, uint64_t mask)
+
+static uint64_t lookup(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, uint64_t mask)
 {
-    (void)lb; (void)p; (void)n; (void)s; (void)mask;
+    (void)lb;
+    (void)p;
+    (void)n;
+    (void)s;
+    (void)mask;
+
+    return 0;
 }
 
 static uint64_t nothing(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, uint64_t mask)
@@ -108,8 +112,7 @@ static uint64_t nothing(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, uint64_t
 
 static uint32_t replica_of(const pkt_state_t *s)
 {
-    (void)s;
-    return 0;
+    return s->replica;
 }
 
 static const lb_ops_t ops = {
@@ -138,9 +141,14 @@ int main(int argc, char **argv)
         uint8_t n = gen_rx_batch(g, GEN_NIC_EXT, p, 64);
         uint64_t all = n == 64 ? ~0ull : (1ull << n) - 1;
         gen_hash(g, lb, p, n, s, all);
-        uint64_t ok = ...; /* the packets of a service; the other are dropped */
-        uint64_t hit = gen_lookup(g, lb, n, s, ok);
-        uint64_t got = gen_replica(g, lb, n, s, ok & ~hit);
+        uint64_t ok = 0;
+        for (uint8_t i = 0; i < n; i++) {
+            if (s[i].valid) {
+                ok |= (1ull << i);
+            }
+        }
+        uint64_t hit = gen_lookup(g, lb, p, n, s, ok);
+        uint64_t got = gen_replica(g, lb, p, n, s, ok & ~hit);
         gen_insert(g, lb, p, n, s, got); /* the new flow among them */
         /* encapsulate hit | got, then: */
         gen_tx_batch(g, GEN_NIC_INT, p, n, hit | got);
