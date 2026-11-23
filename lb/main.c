@@ -15,14 +15,17 @@
  * them too.  README.md documents the harness.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "gen.h"
 #include "parser.h"
+#include "ring.h"
 #include "crc32c.h"
 
 struct lb {
     gen_config_t cfg; // copy of gen_config_t
+    ring_t *rings;    /* one consistent-hash ring per service, cfg.services[k] -> rings[k] (Atieh) */
     // TODO: define flow table, hash table
 };
 struct pkt_state {
@@ -34,17 +37,46 @@ struct pkt_state {
     uint8_t valid;
 };
 
+/* The harness does not check init's result: it goes on to call the copy's hash with a NULL lb and crashes
+   (segfault in hash). So a setup error must end the run here, with a message, rather than return NULL. */
+static void init_fail(const char *msg)
+{
+    fprintf(stderr, "init: %s\n", msg);
+    exit(1);
+}
+
 static lb_t *init(gen_t *g, const gen_config_t *cfg)
 {
     lb_t *lb = gen_alloc(g, sizeof(lb_t), 0, 0);
-    if (!lb) {
-        fprintf(stderr, "gen_alloc for LB failed\n");
-        return NULL;
-    }
+    if (!lb)
+        init_fail("gen_alloc for LB failed");
     lb->cfg = *cfg;
-    // (void)cfg;
-    // return gen_alloc(g, sizeof(lb_t), 0, 0);
+
+    /* Replica selection (Atieh): one ring per service, ring_v points per replica (default 100). */
+    const char *pv = gen_param(g, "ring_v");
+    char *end = NULL;
+    unsigned long v = pv ? strtoul(pv, &end, 10) : 100;
+    if (v == 0 || v > 100000 || (pv && (end == pv || *end != '\0')))   /* rejects "", "abc", "100x" */
+        init_fail("ring_v must be a whole number between 1 and 100000");
+    lb->rings = gen_alloc(g, (cfg->n_services ? cfg->n_services : 1) * sizeof *lb->rings, 0, 0);
+    if (!lb->rings)
+        init_fail("gen_alloc for rings failed");
+    for (uint32_t k = 0; k < cfg->n_services; k++)
+        if (!ring_init(&lb->rings[k], g, &cfg->services[k], (uint32_t)v, cfg->seed))
+            init_fail("gen_alloc for a service's ring failed (ring_v too large for the memory budget?)");
     return lb;
+}
+
+/* Made by Atieh: replica events update the service's ring (incrementally, see src/ring.c). */
+static void on_event(lb_t *lb, const gen_event_t *ev)
+{
+    if (ev->service >= lb->cfg.n_services)
+        return;
+    /* ring_init reserved room for the published scenarios' churn, so this does not allocate there. If it
+       has to and gen_alloc fails, this instance's ring no longer matches the copy's: say so loudly. */
+    if (!ring_event(&lb->rings[ev->service], (int)ev->type, ev->ipv4))
+        fprintf(stderr, "ring: gen_alloc failed on a replica event (service %u, type %d): ring not updated\n",
+                ev->service, (int)ev->type);
 }
 
 /*Made By ludovick and next modify by samuel*/
@@ -94,6 +126,15 @@ static void hash(lb_t *lb, pkt_t **p, uint8_t n,
 }
 
 
+/* (Atieh) What the flow table needs from replica selection -- measured with a stand-in table:
+ *   - store the replica as its id, ring_replica_id(&lb->rings[svc], s[i].replica) at insert (16 bits are
+ *     enough), and read it back with ring_ip(); ids never change during a run;
+ *   - on a hit, if ring_state(r, id) == REPLICA_STATE_DOWN: treat it as a miss (the flow is lost; its
+ *     packets must go elsewhere, and its client's retransmitted SYN must not go back to the dead replica);
+ *   - on a hit by a SYN (SYN set, ACK not set), if ring_state(r, id) != REPLICA_STATE_ACTIVE: treat it as a
+ *     miss too. A retransmitted SYN is a new-flow decision: without this, a SYN whose replica failed
+ *     silently and was then drained is sent to a draining replica (44 misplaced flows on events.scn).
+ *   With neither check, tests/failover.scn and tests/churn.scn fail (52 and 83 misplaced flows). */
 static uint64_t lookup(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, uint64_t mask)
 {
     (void)lb;
@@ -103,6 +144,24 @@ static uint64_t lookup(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, uint64_t 
     (void)mask;
 
     return 0;
+}
+
+/* Made by Atieh: consistent hashing over the service's active replicas.
+   Works on its own (the harness's copy calls it right after hash, without lookup). */
+static uint64_t compute_replica(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, uint64_t mask)
+{
+    (void)p;
+    uint64_t ok = 0;
+    for (uint8_t i = 0; i < n; i++) {
+        if (!(mask & (1ull << i)) || !s[i].valid)
+            continue;
+        uint32_t ip = ring_lookup(&lb->rings[s[i].service_id], s[i].hash);
+        if (!ip)
+            continue;   /* no active replica in this service */
+        s[i].replica = ip;
+        ok |= 1ull << i;
+    }
+    return ok;
 }
 
 static uint64_t nothing(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, uint64_t mask)
@@ -119,9 +178,10 @@ static uint32_t replica_of(const pkt_state_t *s)
 static const lb_ops_t ops = {
     .state_size = sizeof(pkt_state_t),
     .init = init,
+    .on_event = on_event,
     .hash = hash,
     .lookup = lookup,
-    .compute_replica = nothing,
+    .compute_replica = compute_replica,
     .insert = nothing,
     .replica_of = replica_of,
 };

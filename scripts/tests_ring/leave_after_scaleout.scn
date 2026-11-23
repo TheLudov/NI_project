@@ -1,0 +1,9 @@
+# an LB leaves 30 s after a chat scale-out (+25 %), no draining replica at that time
+duration 200
+warmup 30
+service chat
+  vip 198.51.100.10 port 443 proto tcp
+  replicas 64 10.1.0.1
+  model chat flows=50k lifetime=1h keepalive=60 event_interval=2min
+  scale_out at=60 add=25%
+lb leave at=90 fraction=0.25
