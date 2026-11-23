@@ -15,19 +15,25 @@
  * them too.  README.md documents the harness.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "gen.h"
 #include "parser.h"
 #include "crc32c.h"
+#include "tabhash.h"
+
+/* Flow hash function, chosen with the param hashfn=tab (default) or hashfn=crc (the E2 baseline). */
+enum { HASH_TAB, HASH_CRC };
 
 struct lb {
     gen_config_t cfg; // copy of gen_config_t
-    // TODO: define flow table, hash table
+    tabhash_t *th;    /* simple tabulation hashing tables, filled from cfg.seed */
+    uint8_t hashfn;   /* HASH_TAB or HASH_CRC */
 };
 struct pkt_state {
     flow_key_t key;
-    uint32_t hash;
+    uint64_t hash;
     uint32_t replica;
     uint32_t service_id;
     uint8_t tcp_flags;
@@ -42,12 +48,41 @@ static lb_t *init(gen_t *g, const gen_config_t *cfg)
         return NULL;
     }
     lb->cfg = *cfg;
-    // (void)cfg;
-    // return gen_alloc(g, sizeof(lb_t), 0, 0);
+
+    /* The harness does not check init's result, so a setup error ends the run here, with a message. */
+    const char *hf = gen_param(g, "hashfn");
+    if (!hf || strcmp(hf, "tab") == 0) {
+        lb->hashfn = HASH_TAB;
+    } else if (strcmp(hf, "crc") == 0) {
+        lb->hashfn = HASH_CRC;
+    } else {
+        fprintf(stderr, "bad hashfn=%s: tab or crc\n", hf);
+        exit(1);
+    }
+
+    lb->th = gen_alloc(g, sizeof(tabhash_t), 64, 0);
+    if (!lb->th) {
+        fprintf(stderr, "gen_alloc for the tabulation tables failed\n");
+        exit(1);
+    }
+    tabhash_init(lb->th, cfg->seed);
     return lb;
 }
 
-/*Made By ludovick and next modify by samuel*/
+/* CRC32C of the 5-tuple, seeded: the E2 baseline (32 bits, zero-extended). */
+static inline uint64_t crc_flow(uint64_t seed, const flow_key_t *key)
+{
+    uint64_t ips = ((uint64_t)key->src_ip << 32) | key->dst_ip;
+    uint32_t ports = ((uint32_t)key->src_port << 16) | key->dst_port;
+
+    uint32_t h = crc32c_u64(~0u, seed);
+    h = crc32c_u64(h, ips);
+    h = crc32c_u32(h, ports);
+    h = crc32c_u8(h, key->protocol);
+    return h;
+}
+
+/*Made By ludovic and next modify by samuel*/
 
 static void hash(lb_t *lb, pkt_t **p, uint8_t n,
                  pkt_state_t *s, uint64_t mask)
@@ -80,16 +115,8 @@ static void hash(lb_t *lb, pkt_t **p, uint8_t n,
 
         if (!s[i].valid)
             continue;
-        // Compute CRC32C hash of the 5-tuple
-        uint64_t ips = ((uint64_t)key->src_ip << 32) | key->dst_ip;
-        uint32_t ports = ((uint32_t)key->src_port << 16) | key->dst_port;
-
-        uint32_t h = crc32c_u64(~0u, lb->cfg.seed);
-        h = crc32c_u64(h, ips);
-        h = crc32c_u32(h, ports);
-        h = crc32c_u8(h, key->protocol);
-
-        s[i].hash = h;
+        // Hash the 5-tuple: simple tabulation (default) or CRC32C (baseline)
+        s[i].hash = lb->hashfn == HASH_TAB ? tabhash_flow(lb->th, key) : crc_flow(lb->cfg.seed, key);
     }
 }
 
