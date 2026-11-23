@@ -1,0 +1,9 @@
+# an LB leaves while one eighth of the chat replicas is draining
+duration 200
+warmup 30
+service chat
+  vip 198.51.100.10 port 443 proto tcp
+  replicas 64 10.1.0.1
+  model chat flows=50k lifetime=1h keepalive=60 event_interval=2min
+  upgrade start=60 interval=40 drain=25 groups=8
+lb leave at=70 fraction=0.25
