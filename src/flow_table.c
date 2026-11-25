@@ -24,9 +24,12 @@ static inline uint32_t *bucket_at(const flow_table_t *ft, uint32_t bucket_index)
     return ft->slots + (size_t)bucket_index * ft->bucket_size;
 }
 
-/* The signature of a key: the top sig_bits bits of its hash. Two keys may share one: the full key decides. */
+/* The signature of a key: the top sig_bits bits of the low 32 bits of its hash. Two keys may share one: the full
+ * key decides. Low half, because crc_flow gives only 32 bits (the top of the 64 would always be 0) and because
+ * tabulation's second bucket uses the high half (get_bucket_indices). The first bucket uses the low log2(num_buckets)
+ * bits, so the two are disjoint when num_buckets is a power of two and log2(num_buckets) + sig_bits <= 32. */
 static inline uint32_t sig_of(const flow_table_t *ft, uint64_t hash) {
-    return (uint32_t)(hash >> (64 - ft->sig_bits));
+    return (uint32_t)hash >> (32 - ft->sig_bits);
 }
 
 /* The signature held in a non-empty slot */
@@ -71,19 +74,28 @@ static inline void slot_release(flow_table_t *ft, uint32_t *slot) {
 }
 
 
-flow_table_t *ft_init(gen_t *g, uint32_t num_buckets, uint32_t bucket_size, uint32_t max_depth, uint32_t dfs_budget, uint8_t hashfn, const tabhash_t *th, uint64_t seed)
+flow_table_t *ft_init(gen_t *g, uint32_t num_buckets, uint32_t bucket_size, uint32_t max_depth, uint32_t dfs_budget,
+                      uint8_t sig_bits, uint8_t hashfn, const tabhash_t *th, uint64_t seed)
 {
     // check if valide value
-    if(num_buckets <2 || bucket_size == 0 || max_depth == 0)
+    if(num_buckets <2 || bucket_size == 0 || max_depth == 0 || sig_bits > FT_MAX_SIG_BITS)
         return NULL;
     uint64_t capacity = (uint64_t)num_buckets * bucket_size;
 
-    // index bits: enough for capacity (an entry index + 1 is at most capacity); the rest is the signature
+    // index bits: enough for capacity (an entry index + 1 is at most capacity); the signature takes at most the rest
     uint32_t idx_bits = 1;
     while (((1ull << idx_bits) - 1) < capacity)
         idx_bits++;
-    if (32 - idx_bits < FT_MIN_SIG_BITS)
+    if (idx_bits > 32 - 1)
         return NULL;
+    uint32_t max_sig = 32 - idx_bits;
+    if (sig_bits == 0) { // automatic: every free bit, but no fewer than FT_MIN_SIG_BITS
+        if (max_sig < FT_MIN_SIG_BITS)
+            return NULL;
+        sig_bits = (uint8_t)max_sig;
+    } else if (sig_bits > max_sig) {
+        return NULL;
+    }
 
     flow_table_t *ft = (flow_table_t *) gen_alloc(g, sizeof(flow_table_t), 0, 0);
 
@@ -99,7 +111,8 @@ flow_table_t *ft_init(gen_t *g, uint32_t num_buckets, uint32_t bucket_size, uint
     ft->th = th;
     ft->seed = seed;
     ft->capacity = (uint32_t)capacity;
-    ft->sig_bits = (uint8_t)(32 - idx_bits);
+    ft->sig_bits = sig_bits;
+    memset(&ft->stats, 0, sizeof ft->stats);
 
     // 64-byte aligned, so that a bucket of 16 slots is exactly one cache line
     ft->slots = (uint32_t *) gen_alloc(g, (size_t)capacity * sizeof(uint32_t), 64, 0);
@@ -140,6 +153,9 @@ flow_entry_t *ft_find(flow_table_t *ft, const flow_key_t *key, uint64_t hash, ui
     uint32_t buckets[2];
     get_bucket_indices(ft, hash, &buckets[0], &buckets[1]);
     uint32_t sig = sig_of(ft, hash);
+#if FT_STATS
+    ft->stats.lookups++;
+#endif
 
     //check the two buckets of the key; a key is stored at most once
     //the entry array is read only on a signature match
@@ -149,13 +165,29 @@ flow_entry_t *ft_find(flow_table_t *ft, const flow_key_t *key, uint64_t hash, ui
         for(uint32_t i = 0; i< ft->bucket_size; i++)
         {
             uint32_t s = bucket[i];
-            if(s == 0 || slot_sig(ft, s) != sig)
+            if(s == 0)
                 continue;
+#if FT_STATS
+            ft->stats.slots_checked++;
+#endif
+            if(slot_sig(ft, s) != sig)
+                continue;
+#if FT_STATS
+            ft->stats.sig_matches++;
+#endif
             flow_entry_t *e = slot_entry(ft, s);
-            if(!same_flow_key(&e->key, key))
+            if(!same_flow_key(&e->key, key)) {
+#if FT_STATS
+                ft->stats.false_matches++;
+#endif
                 continue; //same signature, other flow
-            if(e->expiration_time > current_time)
+            }
+            if(e->expiration_time > current_time) {
+#if FT_STATS
+                ft->stats.hits++;
+#endif
                 return e;
+            }
             slot_release(ft, &bucket[i]); //expired: free the slot and its entry
             return NULL;
         }

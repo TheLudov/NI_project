@@ -8,7 +8,23 @@
 #include "crc32c.h"
 
 #define FT_NO_ENTRY UINT32_MAX // end of the free list
-#define FT_MIN_SIG_BITS 8 // fewest signature bits a slot may keep (2^(32-8) - 1 entries at most)
+#define FT_MIN_SIG_BITS 8 // fewest signature bits the automatic width (sig_bits = 0) may give (2^(32-8) - 1 entries at most)
+#define FT_MAX_SIG_BITS 31 // most signature bits: at least one bit is needed for the entry index
+
+// 1: ft_find counts its signature comparisons in ft->stats
+// 0 (default, the Makefile's build): no counting, nothing added to the lookup loop.
+#ifndef FT_STATS
+#define FT_STATS 0
+#endif
+
+//counters of ft_find (only with FT_STATS)
+typedef struct {
+    uint64_t lookups; // ft_find calls
+    uint64_t hits; // of those, a live entry returned
+    uint64_t slots_checked; // non-empty slots whose signature was compared with the key's
+    uint64_t sig_matches; // of those, same signature: the entry array was read
+    uint64_t false_matches; // of those, another flow's key (signature collision)
+} ft_stats_t;
 
 //struct to represent a flow entry in the flow table (one element of the entry array)
 //field order: 32 bytes (two entries per cache line) instead of 40 with the key first
@@ -21,7 +37,7 @@ typedef struct {
     uint8_t state; //state of the flow: half-open, established, closing (lb/main.c)
 }flow_entry_t;
 
-//struct to represent the flow table: a cuckoo index (slots) and an entry array (entries), brief item 2
+//struct to represent the flow table: a cuckoo index (slots) and an entry array (entries)
 //A slot is one uint32_t: ((entry index + 1) << sig_bits) | signature, and 0 means an empty slot.
 typedef struct {
     uint32_t *slots; // cuckoo index: num_buckets * bucket_size slots, bucket after bucket
@@ -37,6 +53,7 @@ typedef struct {
     uint8_t hashfn; // hash function used for the flow table
     const tabhash_t *th; // pointer to the tabulation hash structure
     uint64_t seed; // seed for initializing the hash tables
+    ft_stats_t stats; // ft_find's counters (stay 0 when FT_STATS is 0)
 }flow_table_t;
 
 
@@ -48,13 +65,17 @@ num_buckets: size of the flow table
 bucket_size: number of entries in the flow table
 max_depth: Maximum depth for DFS search (displacements per insert)
 dfs_budget: Maximum entries examined by one insert's displacement search (both buckets)
+sig_bits: signature width in bits (E1 sweep). 0: automatic, every bit the entry index leaves free (at least
+          FT_MIN_SIG_BITS). Otherwise 1..32 - idx_bits, where idx_bits is the bits needed for num_buckets * bucket_size
 hashfn: hash function used for the flow table
 th: pointer to the hash table
 seed: seed used for the hash
-Return: Pointer to the initialized flow table or NULL if the initialization fails (also when the table is too large
-        for a slot to keep at least FT_MIN_SIG_BITS signature bits, i.e. num_buckets * bucket_size >= 2^24)
+Return: Pointer to the initialized flow table or NULL if the initialization fails (also when sig_bits does not fit
+        next to the entry index, or, with sig_bits = 0, when the table is too large for a slot to keep at least
+        FT_MIN_SIG_BITS signature bits, i.e. num_buckets * bucket_size >= 2^24)
 */
-flow_table_t *ft_init(gen_t *g, uint32_t num_buckets, uint32_t bucket_size, uint32_t max_depth, uint32_t dfs_budget, uint8_t hashfn, const tabhash_t *th, uint64_t seed);
+flow_table_t *ft_init(gen_t *g, uint32_t num_buckets, uint32_t bucket_size, uint32_t max_depth, uint32_t dfs_budget,
+                      uint8_t sig_bits, uint8_t hashfn, const tabhash_t *th, uint64_t seed);
 // hash function used for the flow table
 /*Function of look_up
 Param:

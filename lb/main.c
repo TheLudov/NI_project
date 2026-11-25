@@ -170,10 +170,13 @@ static lb_t *init(gen_t *g, const gen_config_t *cfg)
     uint32_t bs = (uint32_t)param_ul(g, "bucket_size", 10, 2, 64);
     uint32_t md = (uint32_t)param_ul(g, "max_depth", 5, 2, 16);
     uint32_t dfs = (uint32_t)param_ul(g, "dfs_budget", 64, 2, 100000);
+    // signature width: 0 = every bit the entry index leaves free
+    uint8_t sb = (uint8_t)param_ul(g, "sig_bits", 0, 0, FT_MAX_SIG_BITS);
 
-    lb->ft = ft_init(g, nb, bs, md, dfs, lb->hashfn, lb->th, cfg->seed);
+    lb->ft = ft_init(g, nb, bs, md, dfs, sb, lb->hashfn, lb->th, cfg->seed);
     if (!lb->ft) {
-        init_fail("flow table initialization failed (ft_buckets * bucket_size too large for the memory budget?)");
+        init_fail("flow table initialization failed (ft_buckets * bucket_size too large for the memory budget, "
+                  "or sig_bits too wide for the bits the entry index leaves free?)");
     }
 
     init_timeouts(g, lb);
@@ -415,6 +418,20 @@ int main(int argc, char **argv)
         gen_tx_batch(g, GEN_NIC_INT, p, n, send);
         gen_drop(g, p, n, all & ~send);
     }
+#if FT_STATS
+    /* E1: the main LB's flow-table counters, raw, on one line of stderr (key=value), with the table's layout and
+       its occupancy at the end. scripts/tests_ft/false_matches.sh parses it and compares with the theory. */
+    const flow_table_t *ft = lb->ft;
+    const ft_stats_t *st = &ft->stats;
+    uint64_t used = 0;
+    for (uint32_t i = 0; i < ft->capacity; i++)
+        used += ft->slots[i] != 0;
+    fprintf(stderr, "ft_stats: sig_bits=%u num_buckets=%u bucket_size=%u capacity=%u slots_used=%llu lookups=%llu "
+            "hits=%llu slots_checked=%llu sig_matches=%llu false_matches=%llu\n",
+            ft->sig_bits, ft->num_buckets, ft->bucket_size, ft->capacity, (unsigned long long)used,
+            (unsigned long long)st->lookups, (unsigned long long)st->hits, (unsigned long long)st->slots_checked,
+            (unsigned long long)st->sig_matches, (unsigned long long)st->false_matches);
+#endif
     gen_close(g);
     return 0;
 }
