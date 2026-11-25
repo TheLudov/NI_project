@@ -166,12 +166,14 @@ static lb_t *init(gen_t *g, const gen_config_t *cfg)
     }
     tabhash_init(lb->th, cfg->seed);
 
-    /* Flow table (Samuel): ft_buckets buckets of BUCKET_SIZE slots. The default, 65536 x 10 = 655 k slots
-       (21 MB) */
     uint32_t nb = (uint32_t)param_ul(g, "ft_buckets", 65536, 2, UINT32_MAX);
-    lb->ft = ft_init(g, nb, lb->hashfn, lb->th, cfg->seed);
+    uint32_t bs = (uint32_t)param_ul(g, "bucket_size", 10, 2, 64);
+    uint32_t md = (uint32_t)param_ul(g, "max_depth", 5, 2, 16);
+    uint32_t dfs = (uint32_t)param_ul(g, "dfs_budget", 64, 2, 100000);
+
+    lb->ft = ft_init(g, nb, bs, md, dfs, lb->hashfn, lb->th, cfg->seed);
     if (!lb->ft) {
-        init_fail("flow table initialization failed (ft_buckets too large for the memory budget?)");
+        init_fail("flow table initialization failed (ft_buckets * bucket_size too large for the memory budget?)");
     }
 
     init_timeouts(g, lb);

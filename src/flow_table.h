@@ -2,8 +2,6 @@
 #ifndef FLOW_TABLE_H
 #define FLOW_TABLE_H
 
-#define BUCKET_SIZE 10 // number of entries in the flow table
-
 #include "parser.h"
 #include "gen.h"
 #include "tabhash.h"
@@ -21,14 +19,18 @@ typedef struct {
 }flow_entry_t;
 
 //struct to represent a bucket in the flow table
-typedef struct{
-    flow_entry_t entries[BUCKET_SIZE];
-}flow_bucket_t;
+//typedef struct{
+//    flow_entry_t entries[BUCKET_SIZE];
+//}flow_bucket_t;
 
 //struct to represent the flow table
 typedef struct {
-    flow_bucket_t *buckets; // array of buckets
+    // flow_bucket_t *buckets; // array of buckets
+    flow_entry_t *entries;
     uint32_t num_buckets; // number of buckets in the flow table
+    uint32_t bucket_size; // number of entries in the flow table
+    uint32_t max_depth; // Maximum depth for DFS search (displacements per insert)
+    uint32_t dfs_budget; // Maximum entries examined by one insert's displacement search (both buckets)
     uint8_t hashfn; // hash function used for the flow table
     const tabhash_t *th; // pointer to the tabulation hash structure
     uint64_t seed; // seed for initializing the hash tables
@@ -39,12 +41,17 @@ typedef struct {
 /*Function of initialization
 Param:
 g: pointer to the generator
-Bucket_size: size of the flow table
-
+num_buckets: size of the flow table
+bucket_size: number of entries in the flow table
+max_depth: Maximum depth for DFS search (displacements per insert)
+dfs_budget: Maximum entries examined by one insert's displacement search (both buckets)
+hashfn: hash function used for the flow table
+th: pointer to the hash table
+seed: seed used for the hash
 Return: Pointer to the initialized flow table or NULL if the initialization fails
 */
-flow_table_t *ft_init(gen_t *g, uint32_t Bucket_number, uint8_t hashfn, const tabhash_t *th, uint64_t seed);
-
+flow_table_t *ft_init(gen_t *g, uint32_t num_buckets, uint32_t bucket_size, uint32_t max_depth, uint32_t dfs_budget, uint8_t hashfn, const tabhash_t *th, uint64_t seed);
+// hash function used for the flow table
 /*Function of look_up
 Param:
 ft: pointer to the flow table
