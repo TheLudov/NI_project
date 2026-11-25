@@ -1,4 +1,4 @@
-/* lb/main.c: your LB's main loop (a stub: it drops every packet).
+/* lb/main.c: the LB's main program: its stages (lb_ops_t) and its loop.
  *
  *   build/lb SCENARIO "PARAMS"
  *
@@ -21,17 +21,34 @@
 #include "gen.h"
 #include "parser.h"
 #include "ring.h"
-#include "crc32c.h"
+#include "flow_table.h"
 #include "tabhash.h"
 
+#define TCP_FIN 0x01
+#define TCP_SYN 0x02
+#define TCP_RST 0x04
+#define TCP_ACK 0x10
 
+/* Flow states, kept in flow_entry_t.state (brief, item 2: half-open, established, closing). */
+enum { FS_HALF_OPEN, FS_ESTABLISHED, FS_CLOSING };
+
+/* A connection's first packet: SYN set, ACK not set (a SYN-ACK never reaches the LB: replies bypass it). */
+static inline int is_syn(uint8_t f) { return (f & (TCP_SYN | TCP_ACK)) == TCP_SYN; }
+
+/* Idle timeouts of one service, per state, in ns of trace time. */
+typedef struct {
+    uint64_t half;    /* half-open: SYN seen, no ACK yet */
+    uint64_t est;     /* established (also a UDP flow, and a TCP flow first seen mid-flow) */
+    uint64_t fin;     /* closing: grace period after a FIN or RST, never extended */
+} svc_timeouts_t;
 
 struct lb {
     gen_config_t cfg; // copy of gen_config_t
     ring_t *rings;    /* one consistent-hash ring per service, cfg.services[k] -> rings[k] (Atieh) */
-    // TODO: define flow table, hash table
+    flow_table_t *ft; /* cuckoo flow table (Samuel) */
     tabhash_t *th;    /* simple tabulation hashing tables, filled from cfg.seed */
     uint8_t hashfn;   /* HASH_TAB or HASH_CRC */
+    svc_timeouts_t *to; /* timeouts per service, indexed by service_id */
 };
 struct pkt_state {
     flow_key_t key;
@@ -42,6 +59,26 @@ struct pkt_state {
     uint8_t valid;
 };
 
+static inline uint64_t timeout_of(const lb_t *lb, uint32_t svc, uint8_t st)
+{
+    const svc_timeouts_t *t = &lb->to[svc];
+    return st == FS_HALF_OPEN ? t->half : st == FS_CLOSING ? t->fin : t->est;
+}
+
+/* State of a flow inserted on this packet: a SYN opens it, a FIN or RST closes it, anything else is a flow
+   already in progress (from another LB, or evicted earlier). UDP has no handshake: established. */
+static uint8_t first_state(const pkt_state_t *s)
+{
+    if (s->key.protocol != 6)
+        return FS_ESTABLISHED;
+    if (s->tcp_flags & (TCP_FIN | TCP_RST))
+        return FS_CLOSING;
+    if (is_syn(s->tcp_flags))
+        return FS_HALF_OPEN;
+    return FS_ESTABLISHED;
+}
+
+
 /* The harness does not check init's result: it goes on to call the copy's hash with a NULL lb and crashes
    (segfault in hash). So a setup error must end the run here, with a message, rather than return NULL. */
 static void init_fail(const char *msg)
@@ -50,43 +87,94 @@ static void init_fail(const char *msg)
     exit(1);
 }
 
+/* A whole-number parameter in [min, max], def if absent; a bad value ends the run (rejects "", "abc", "100x"). */
+static unsigned long param_ul(gen_t *g, const char *key, unsigned long def, unsigned long min, unsigned long max)
+{
+    const char *v = gen_param(g, key);
+    if (!v)
+        return def;
+    char *end = NULL;
+    unsigned long x = strtoul(v, &end, 10);
+    if (end == v || *end != '\0' || x < min || x > max) {
+        fprintf(stderr, "init: %s=%s: must be a whole number between %lu and %lu\n", key, v, min, max);
+        exit(1);
+    }
+    return x;
+}
+
+#define MS 1000000ull           /* ns per ms */
+#define TO_MAX_MS 86400000ul    /* timeouts: at most a day */
+
+/* Timeouts, in ms: to_half_ms, to_est_ms, to_fin_ms for every service, then optional overrides per service,
+   keyed by its VIP */
+static void init_timeouts(gen_t *g, lb_t *lb)
+{
+    static const char *const names[3] = { "to_half_ms", "to_est_ms", "to_fin_ms" };
+    static const unsigned long defaults[3] = { 1000, 130000, 2000 };
+    unsigned long base[3];
+    for (int k = 0; k < 3; k++)
+        base[k] = param_ul(g, names[k], defaults[k], 1, TO_MAX_MS);
+
+    uint32_t n = lb->cfg.n_services;
+    lb->to = gen_alloc(g, (n ? n : 1) * sizeof *lb->to, 0, 0);
+    if (!lb->to)
+        init_fail("gen_alloc for the timeouts failed");
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t vip = lb->cfg.services[i].vip;
+        unsigned long ms[3];
+        for (int k = 0; k < 3; k++) {
+            char key[64];
+            snprintf(key, sizeof key, "%s_%u.%u.%u.%u", names[k],
+                     vip >> 24, (vip >> 16) & 0xff, (vip >> 8) & 0xff, vip & 0xff);
+            ms[k] = param_ul(g, key, base[k], 1, TO_MAX_MS);
+        }
+        lb->to[i].half = ms[0] * MS;
+        lb->to[i].est = ms[1] * MS;
+        lb->to[i].fin = ms[2] * MS;
+    }
+}
+
 static lb_t *init(gen_t *g, const gen_config_t *cfg)
 {
     lb_t *lb = gen_alloc(g, sizeof(lb_t), 0, 0);
     if (!lb)
         init_fail("gen_alloc for LB failed");
+    memset(lb, 0, sizeof *lb);
     lb->cfg = *cfg;
 
     /* Replica selection (Atieh): one ring per service, ring_v points per replica (default 100). */
-    const char *pv = gen_param(g, "ring_v");
-    char *end = NULL;
-    unsigned long v = pv ? strtoul(pv, &end, 10) : 100;
-    if (v == 0 || v > 100000 || (pv && (end == pv || *end != '\0')))   /* rejects "", "abc", "100x" */
-        init_fail("ring_v must be a whole number between 1 and 100000");
+    uint32_t v = (uint32_t)param_ul(g, "ring_v", 100, 1, 100000);
     lb->rings = gen_alloc(g, (cfg->n_services ? cfg->n_services : 1) * sizeof *lb->rings, 0, 0);
     if (!lb->rings)
         init_fail("gen_alloc for rings failed");
     for (uint32_t k = 0; k < cfg->n_services; k++)
-        if (!ring_init(&lb->rings[k], g, &cfg->services[k], (uint32_t)v, cfg->seed))
+        if (!ring_init(&lb->rings[k], g, &cfg->services[k], v, cfg->seed))
             init_fail("gen_alloc for a service's ring failed (ring_v too large for the memory budget?)");
 
-    /* The harness does not check init's result, so a setup error ends the run here, with a message. */
     const char *hf = gen_param(g, "hashfn");
     if (!hf || strcmp(hf, "tab") == 0) {
         lb->hashfn = HASH_TAB;
     } else if (strcmp(hf, "crc") == 0) {
         lb->hashfn = HASH_CRC;
     } else {
-        fprintf(stderr, "bad hashfn=%s: tab or crc\n", hf);
-        exit(1);
+        init_fail("bad hashfn value: tab or crc");
     }
 
     lb->th = gen_alloc(g, sizeof(tabhash_t), 64, 0);
     if (!lb->th) {
-        fprintf(stderr, "gen_alloc for the tabulation tables failed\n");
-        exit(1);
+        init_fail("gen_alloc for the tabulation tables failed");
     }
     tabhash_init(lb->th, cfg->seed);
+
+    /* Flow table (Samuel): ft_buckets buckets of BUCKET_SIZE slots. The default, 65536 x 10 = 655 k slots
+       (21 MB) */
+    uint32_t nb = (uint32_t)param_ul(g, "ft_buckets", 65536, 2, UINT32_MAX);
+    lb->ft = ft_init(g, nb, lb->hashfn, lb->th, cfg->seed);
+    if (!lb->ft) {
+        init_fail("flow table initialization failed (ft_buckets too large for the memory budget?)");
+    }
+
+    init_timeouts(g, lb);
     return lb;
 }
 
@@ -100,19 +188,6 @@ static void on_event(lb_t *lb, const gen_event_t *ev)
     if (!ring_event(&lb->rings[ev->service], (int)ev->type, ev->ipv4))
         fprintf(stderr, "ring: gen_alloc failed on a replica event (service %u, type %d): ring not updated\n",
                 ev->service, (int)ev->type);
-}
-
-/* CRC32C of the 5-tuple, seeded: the E2 baseline (32 bits, zero-extended). */
-static inline uint64_t crc_flow(uint64_t seed, const flow_key_t *key)
-{
-    uint64_t ips = ((uint64_t)key->src_ip << 32) | key->dst_ip;
-    uint32_t ports = ((uint32_t)key->src_port << 16) | key->dst_port;
-
-    uint32_t h = crc32c_u64(~0u, seed);
-    h = crc32c_u64(h, ips);
-    h = crc32c_u32(h, ports);
-    h = crc32c_u8(h, key->protocol);
-    return h;
 }
 
 /*Made By ludovic and next modify by samuel*/
@@ -165,13 +240,43 @@ static void hash(lb_t *lb, pkt_t **p, uint8_t n,
  *   With neither check, tests/failover.scn and tests/churn.scn fail (52 and 83 misplaced flows). */
 static uint64_t lookup(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, uint64_t mask)
 {
-    (void)lb;
-    (void)p;
-    (void)n;
-    (void)s;
-    (void)mask;
+    uint64_t hit = 0;
+    for (uint8_t i = 0; i < n; i++) {
+        if (!(mask & (1ull << i)) || !s[i].valid)
+            continue;
+        uint64_t now = p[i]->ts_ns;
+        flow_entry_t *e = ft_find(lb->ft, &s[i].key, s[i].hash, now);
+        if (!e)
+            continue;                                       /* miss: not in the table, or expired */
 
-    return 0;
+        const ring_t *r = &lb->rings[s[i].service_id];
+        uint8_t f = s[i].tcp_flags;
+        int syn = s[i].key.protocol == 6 && is_syn(f);
+        uint8_t rs = ring_state(r, e->replica);
+        /* Atieh's two rules: a down replica, or a SYN (a new-flow decision) to a replica that is not active,
+           is a miss. The entry stays: insert overwrites it with compute_replica's choice. */
+        if (rs == REPLICA_STATE_DOWN || (syn && rs != REPLICA_STATE_ACTIVE))
+            continue;
+        s[i].replica = ring_ip(r, e->replica);
+
+        /* Lifecycle (brief, item 5): refresh the last-seen time; FIN or RST starts the closing grace period,
+           which later packets do not extend. */
+        if (s[i].key.protocol == 6 && (f & (TCP_FIN | TCP_RST))) {
+            if (e->state != FS_CLOSING) {
+                e->state = FS_CLOSING;
+                e->expiration_time = now + timeout_of(lb, s[i].service_id, FS_CLOSING);
+            }
+        } else if (syn) {                                   /* a retransmitted SYN, or the 5-tuple reused */
+            e->state = FS_HALF_OPEN;
+            e->expiration_time = now + timeout_of(lb, s[i].service_id, FS_HALF_OPEN);
+        } else if (e->state != FS_CLOSING) {
+            if (e->state == FS_HALF_OPEN && (s[i].key.protocol != 6 || (f & TCP_ACK)))
+                e->state = FS_ESTABLISHED;
+            e->expiration_time = now + timeout_of(lb, s[i].service_id, e->state);
+        }
+        hit |= 1ull << i;
+    }
+    return hit;
 }
 
 /* Made by Atieh: consistent hashing over the service's active replicas.
@@ -192,15 +297,71 @@ static uint64_t compute_replica(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, 
     return ok;
 }
 
-static uint64_t nothing(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, uint64_t mask)
+/* Stores the flows compute_replica gave a replica: new flows (SYN), flows first seen mid-flow (from another LB, or
+   evicted earlier), and flows whose stored replica lookup rejected. ft_insert is an upsert, so two packets of one
+   new flow in the same batch (same hash, same ring: same replica) store a single entry. A failed insert only
+   clears the packet's bit: the main loop forwards it anyway, by consistent hashing (brief, item 5). */
+static uint64_t insert(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, uint64_t mask)
 {
-    (void)lb; (void)p; (void)n; (void)s; (void)mask;
-    return 0;
+    uint64_t stored = 0;
+    for (uint8_t i = 0; i < n; i++) {
+        if (!(mask & (1ull << i)) || !s[i].valid)
+            continue;
+        uint32_t svc = s[i].service_id;
+        uint32_t id = ring_replica_id(&lb->rings[svc], s[i].replica);
+        if (id == RING_NO_ID)
+            continue;                       /* cannot happen: compute_replica returns a replica of the ring */
+        uint64_t now = p[i]->ts_ns;
+        uint8_t st = first_state(&s[i]);
+        if (ft_insert(lb->ft, &s[i].key, id, st, s[i].hash, now + timeout_of(lb, svc, st), now))
+            stored |= 1ull << i;
+    }
+    return stored;
 }
 
 static uint32_t replica_of(const pkt_state_t *s)
 {
     return s->replica;
+}
+
+/* IP-in-IP encapsulation, ported from Atieh's test rig (scripts/tests_ring/e2e_main.c):
+   the new Ethernet and outer IPv4 headers go over the 20 bytes of headroom and the old Ethernet header; the inner
+   packet does not move. */
+static uint16_t ip_checksum(const uint8_t *h)
+{
+    uint32_t sum = 0;
+    for (int i = 0; i < 20; i += 2)
+        sum += ((uint32_t)h[i] << 8) | h[i + 1];
+    while (sum >> 16)
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    return (uint16_t)~sum;
+}
+
+static void put32(uint8_t *b, uint32_t x)
+{
+    b[0] = (uint8_t)(x >> 24); b[1] = (uint8_t)(x >> 16); b[2] = (uint8_t)(x >> 8); b[3] = (uint8_t)x;
+}
+
+static void encap(const lb_t *lb, pkt_t *pk, uint32_t dst)
+{
+    uint8_t *f = pk->buf + pk->off - 20;                        /* the new frame starts in the headroom */
+    uint16_t inner_len = rd16(f + 20 + 14 + 2);                 /* the inner IPv4 total length */
+    memcpy(f, lb->cfg.zone_mac, 6);
+    memcpy(f + 6, lb->cfg.int_mac, 6);
+    f[12] = 0x08; f[13] = 0x00;
+    uint8_t *ip = f + 14;
+    uint16_t tot = (uint16_t)(inner_len + 20);
+    ip[0] = 0x45; ip[1] = 0;
+    ip[2] = (uint8_t)(tot >> 8); ip[3] = (uint8_t)tot;
+    ip[4] = ip[5] = ip[6] = ip[7] = 0;                          /* ID, flags, fragment offset */
+    ip[8] = 64; ip[9] = 4;                                      /* TTL, protocol IP-in-IP */
+    ip[10] = ip[11] = 0;
+    put32(ip + 12, lb->cfg.int_ipv4);
+    put32(ip + 16, dst);
+    uint16_t c = ip_checksum(ip);
+    ip[10] = (uint8_t)(c >> 8); ip[11] = (uint8_t)c;
+    pk->off = (uint16_t)(pk->off - 20);
+    pk->len = (uint16_t)(pk->len + 20);
 }
 
 static const lb_ops_t ops = {
@@ -210,7 +371,7 @@ static const lb_ops_t ops = {
     .hash = hash,
     .lookup = lookup,
     .compute_replica = compute_replica,
-    .insert = nothing,
+    .insert = insert,
     .replica_of = replica_of,
 };
 
@@ -226,11 +387,17 @@ int main(int argc, char **argv)
     pkt_t *p[64];
     pkt_state_t s[64];
     while (gen_running(g)) {
-        /* README version */
+        /* Tunnelled replies (bonus, web_tunnel=1) are not handled: drop whatever reaches the internal NIC. */
+        uint8_t m = gen_rx_batch(g, GEN_NIC_INT, p, 64);
+        if (m)
+            gen_drop(g, p, m, ~0ull);
+
         uint8_t n = gen_rx_batch(g, GEN_NIC_EXT, p, 64);
+        if (n == 0)
+            continue;
         uint64_t all = n == 64 ? ~0ull : (1ull << n) - 1;
         gen_hash(g, lb, p, n, s, all);
-        uint64_t ok = 0;
+        uint64_t ok = 0;                                        /* the packets of a service */
         for (uint8_t i = 0; i < n; i++) {
             if (s[i].valid) {
                 ok |= (1ull << i);
@@ -238,16 +405,13 @@ int main(int argc, char **argv)
         }
         uint64_t hit = gen_lookup(g, lb, p, n, s, ok);
         uint64_t got = gen_replica(g, lb, p, n, s, ok & ~hit);
-        gen_insert(g, lb, p, n, s, got); /* the new flow among them */
-        /* encapsulate hit | got, then: */
-        gen_tx_batch(g, GEN_NIC_INT, p, n, hit | got);
-        gen_drop(g, p, n, all & ~(hit | got));
-
-        /* Stub version */
-        for (int nic = GEN_NIC_EXT; nic <= GEN_NIC_INT; nic++) {
-            uint8_t n = gen_rx_batch(g, nic, p, 64);
-            gen_drop(g, p, n, ~0ull);
-        }
+        gen_insert(g, lb, p, n, s, got);                        /* sent even if the insert fails */
+        uint64_t send = hit | got;
+        for (uint8_t i = 0; i < n; i++)
+            if (send & (1ull << i))
+                encap(lb, p[i], s[i].replica);
+        gen_tx_batch(g, GEN_NIC_INT, p, n, send);
+        gen_drop(g, p, n, all & ~send);
     }
     gen_close(g);
     return 0;

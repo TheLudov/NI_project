@@ -33,6 +33,8 @@ void tabhash_init(tabhash_t *th, uint64_t seed);
 /* Hash of a 5-tuple: byte j of the key indexes table j, the 13 values are XORed. */
 uint64_t tabhash_flow(const tabhash_t *th, const flow_key_t *k);
 
+/* CRC32C of the 5-tuple, seeded: the E2 baseline (32 bits, zero-extended). */
+uint64_t crc_flow(uint64_t seed,const flow_key_t *key);
 /*
 function to compute the hash of a flow key based on the selected hash function (tabulation or CRC32C).
 Parameters:
@@ -43,14 +45,5 @@ Parameters:
 Return: the computed hash value
 */
 uint64_t compute_hash(uint8_t hashfn, const tabhash_t *th, uint64_t seed, const flow_key_t *key);
-
-/*
-Function to compute the CRC32C hash of a flow key.
-Parameters:
-- seed: the seed for initializing the hash table
-- key: pointer to the flow key
-Return: the computed CRC32C hash value
-*/
-static inline uint64_t crc_flow(uint64_t seed,const flow_key_t *key);
 
 #endif /* NI_PROJECT_TABHASH_H */
