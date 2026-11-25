@@ -1,5 +1,7 @@
 /*Create and done By Samuel*/
 #include "flow_table.h"
+
+#include <stddef.h>
 #define MAX_DEPTH 5 // Maximum depth for DFS search (displacements per insert)
 #define FT_DFS_BUDGET 64 // Maximum entries examined by one insert's displacement search (both buckets)
 
