@@ -44,4 +44,13 @@ Return: the computed hash value
 */
 uint64_t compute_hash(uint8_t hashfn, const tabhash_t *th, uint64_t seed, const flow_key_t *key);
 
+/*
+Function to compute the CRC32C hash of a flow key.
+Parameters:
+- seed: the seed for initializing the hash table
+- key: pointer to the flow key
+Return: the computed CRC32C hash value
+*/
+static inline uint64_t crc_flow(uint64_t seed,const flow_key_t *key);
+
 #endif /* NI_PROJECT_TABHASH_H */
