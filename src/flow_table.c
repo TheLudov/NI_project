@@ -14,7 +14,7 @@ int ft_cuuko_DFS(flow_table_t *ft, dfs_state_t *path, uint32_t bucket_index, int
 static void get_bucket_indices(flow_table_t *ft, uint64_t hash, uint32_t *bucket1, uint32_t *bucket2);
 
 
-flow_table_t *ft_init(gen_t *g, uint32_t Bucket_number, uint8_t hashfn)
+flow_table_t *ft_init(gen_t *g, uint32_t Bucket_number, uint8_t hashfn, const tabhash_t *th, uint64_t seed)
 {
     if(Bucket_number <2)
         return NULL;
@@ -27,6 +27,8 @@ flow_table_t *ft_init(gen_t *g, uint32_t Bucket_number, uint8_t hashfn)
 
     ft->num_buckets = Bucket_number;
     ft->hashfn = hashfn;
+    ft->th = th;
+    ft->seed = seed;
     ft->buckets = (flow_bucket_t *) gen_alloc(g, sizeof(flow_bucket_t) * Bucket_number, 0, 0);
 
     if(ft->buckets == NULL)
@@ -232,23 +234,21 @@ int ft_cuuko_DFS(flow_table_t *ft,dfs_state_t *path, uint32_t bucket_index, int 
         return 0;
 
     for(int i = 0; i < BUCKET_SIZE; i++){
-        //hash 
         flow_entry_t *entry = &ft->buckets[bucket_index].entries[i];
-        uint32_t hash  =0; //faire fonction de hashage pour le flow_key 
-        uint32_t bucket1 = hash % ft->num_buckets;
 
-        uint32_t hash2 = crc32c_u64(
-            ~0u,
-            ((uint64_t)hash << 32) | hash
-        );
+        uint64_t hash = compute_hash(ft->hashfn, ft->th, ft->seed, &entry->key);
 
-        uint32_t bucket2 = (bucket1 + 1 + hash2 % (ft->num_buckets - 1)) % ft->num_buckets;
+        uint32_t bucket1, bucket2;
+
+        get_bucket_indices(ft, hash, &bucket1, &bucket2);
 
         uint32_t other_bucket;
-        if(bucket_index == bucket1)
+        if (bucket_index == bucket1)
             other_bucket = bucket2;
-        else
+        else if (bucket_index == bucket2)
             other_bucket = bucket1;
+        else
+            continue;
 
         path[depth].bucket_index = bucket_index;
         path[depth].entry_index = i;
@@ -284,7 +284,7 @@ static void get_bucket_indices(flow_table_t *ft, uint64_t hash, uint32_t *bucket
         *bucket2 = (uint32_t)((*bucket1 + 1 + (hash >> 32) % (ft->num_buckets - 1)) % ft->num_buckets);
     }
     else{
-       *bucket1 = hash % ft->num_buckets;
+       *bucket1 = (uint32_t) hash % ft->num_buckets;
 
         uint32_t hash2 = crc32c_u64( ~0u, ((uint64_t)hash << 32) | hash);
 

@@ -29,6 +29,8 @@ typedef struct {
     flow_bucket_t *buckets; // array of buckets
     uint32_t num_buckets; // number of buckets in the flow table
     uint8_t hashfn; // hash function used for the flow table
+    const tabhash_t *th; // pointer to the tabulation hash structure
+    uint64_t seed; // seed for initializing the hash tables
 }flow_table_t;
 
 
@@ -40,7 +42,7 @@ Bucket_size: size of the flow table
 
 Return: Pointer to the initialized flow table or NULL if the initialization fails
 */
-flow_table_t *ft_init(gen_t *g, uint32_t Bucket_number, uint8_t hashfn);
+flow_table_t *ft_init(gen_t *g, uint32_t Bucket_number, uint8_t hashfn, const tabhash_t *th, uint64_t seed);
 
 /*Function of look_up
 Param:

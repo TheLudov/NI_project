@@ -8,7 +8,7 @@
  * ranges. The tables live in the LB's state (gen_alloc, no globals); both instances (main and copy) get the same
  * seed, so they build the same tables and agree on every hash.
  *
- * Author: Ludovic
+ * Author: Ludovic, and samuel for compute_hash() function
  */
 #ifndef NI_PROJECT_TABHASH_H
 #define NI_PROJECT_TABHASH_H
@@ -16,6 +16,7 @@
 #include <stdint.h>
 
 #include "parser.h"
+#include "crc32c.h"
 
 #define TABHASH_KEY_BYTES 13
 
@@ -31,5 +32,16 @@ void tabhash_init(tabhash_t *th, uint64_t seed);
 
 /* Hash of a 5-tuple: byte j of the key indexes table j, the 13 values are XORed. */
 uint64_t tabhash_flow(const tabhash_t *th, const flow_key_t *k);
+
+/*
+function to compute the hash of a flow key based on the selected hash function (tabulation or CRC32C).
+Parameters:
+- hashfn: the hash function to use (HASH_TAB or HASH_CRC)
+- th: pointer to the tabulation hash structure
+- seed: the seed for initializing the hash tables
+- key: pointer to the flow key
+Return: the computed hash value
+*/
+uint64_t compute_hash(uint8_t hashfn, const tabhash_t *th, uint64_t seed, const flow_key_t *key);
 
 #endif /* NI_PROJECT_TABHASH_H */

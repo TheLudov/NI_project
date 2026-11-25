@@ -1,6 +1,6 @@
 /* tabhash.c: filling the tables of simple tabulation hashing (see tabhash.h).
  *
- * Author: Ludovic
+ * Author: Ludovic and samuel for compute_hash() function
  */
 #include "tabhash.h"
 
@@ -30,4 +30,28 @@ uint64_t tabhash_flow(const tabhash_t *th, const flow_key_t *k) {
          ^ th->t[8][sp & 0xff] ^ th->t[9][sp >> 8]
          ^ th->t[10][dp & 0xff] ^ th->t[11][dp >> 8]
          ^ th->t[12][k->protocol];
+}
+
+uint64_t compute_hash(uint8_t hashfn, const tabhash_t *th, uint64_t seed, const flow_key_t *key){
+    if (hashfn == HASH_TAB)
+        return tabhash_flow(th, key);
+    else
+        return crc_flow(seed, key);
+}
+
+
+static inline uint64_t crc_flow(uint64_t seed,const flow_key_t *key)
+{
+    uint64_t ips = ((uint64_t)key->src_ip << 32)
+                   | key->dst_ip;
+
+    uint32_t ports = ((uint32_t)key->src_port << 16)
+                     | key->dst_port;
+
+    uint32_t h = crc32c_u64(~0u, seed);
+    h = crc32c_u64(h, ips);
+    h = crc32c_u32(h, ports);
+    h = crc32c_u8(h, key->protocol);
+
+    return h;
 }
