@@ -107,10 +107,7 @@ static unsigned long param_ul(gen_t *g, const char *key, unsigned long def, unsi
 #define TO_MAX_MS 86400000ul    /* timeouts: at most a day */
 
 /* Timeouts, in ms: to_half_ms, to_est_ms, to_fin_ms for every service, then optional overrides per service,
-   keyed by its VIP (service names are not in gen_config_t; the VIPs are the same in every scenario), e.g.
-   to_est_ms_198.51.100.30=10000 for web. Defaults: half-open 1 s (a few times the largest RTT, and short against
-   a SYN flood), established 130 s (above chat's keepalive, 60 s +- 10 %), closing 2 s (the last ACK comes one
-   RTT after the FIN). */
+   keyed by its VIP */
 static void init_timeouts(gen_t *g, lb_t *lb)
 {
     static const char *const names[3] = { "to_half_ms", "to_est_ms", "to_fin_ms" };
@@ -155,7 +152,6 @@ static lb_t *init(gen_t *g, const gen_config_t *cfg)
         if (!ring_init(&lb->rings[k], g, &cfg->services[k], v, cfg->seed))
             init_fail("gen_alloc for a service's ring failed (ring_v too large for the memory budget?)");
 
-    /* The harness does not check init's result, so a setup error ends the run here, with a message. */
     const char *hf = gen_param(g, "hashfn");
     if (!hf || strcmp(hf, "tab") == 0) {
         lb->hashfn = HASH_TAB;
@@ -172,7 +168,7 @@ static lb_t *init(gen_t *g, const gen_config_t *cfg)
     tabhash_init(lb->th, cfg->seed);
 
     /* Flow table (Samuel): ft_buckets buckets of BUCKET_SIZE slots. The default, 65536 x 10 = 655 k slots
-       (21 MB), holds chat's 500 k concurrent flows plus the entries still waiting to expire. */
+       (21 MB) */
     uint32_t nb = (uint32_t)param_ul(g, "ft_buckets", 65536, 2, UINT32_MAX);
     lb->ft = ft_init(g, nb, lb->hashfn, lb->th, cfg->seed);
     if (!lb->ft) {
