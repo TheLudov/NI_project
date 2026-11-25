@@ -1,16 +1,18 @@
 /*Create and done By Samuel*/
 #include "flow_table.h"
-#define MAX_DEPTH 5 // Maximum depth for DFS search
+#define MAX_DEPTH 5 // Maximum depth for DFS search (displacements per insert)
+#define FT_DFS_BUDGET 64 // Maximum entries examined by one insert's displacement search (both buckets)
 
 typedef struct {
     uint32_t bucket_index;
     int entry_index;
 } dfs_state_t;
 
-int same_flow_key(flow_key_t *key1, flow_key_t *key2);
-int find_empty_slot(flow_table_t *ft, uint32_t bucket_index);
-int is_in_path(dfs_state_t *path, int depth, uint32_t bucket_index);
-int ft_cuuko_DFS(flow_table_t *ft, dfs_state_t *path, uint32_t bucket_index, int depth, int *path_depth, uint32_t *free_bucket, uint32_t *free_slot);
+static int same_flow_key(const flow_key_t *key1, const flow_key_t *key2);
+static int find_empty_slot(flow_table_t *ft, uint32_t bucket_index, uint64_t current_time);
+static int is_in_path(dfs_state_t *path, int depth, uint32_t bucket_index);
+static int ft_cuuko_DFS(flow_table_t *ft, dfs_state_t *path, uint32_t bucket_index, int depth, int *path_depth,
+                        uint32_t *free_bucket, uint32_t *free_slot, uint64_t current_time, int *budget);
 static void get_bucket_indices(flow_table_t *ft, uint64_t hash, uint32_t *bucket1, uint32_t *bucket2);
 
 
@@ -52,86 +54,88 @@ flow_table_t *ft_init(gen_t *g, uint32_t Bucket_number, uint8_t hashfn, const ta
 
 
 
-int ft_lookup(flow_table_t *ft, flow_key_t *key, uint32_t *replica, uint64_t hash, uint64_t current_time){
-
-    uint32_t bucket1, bucket2;
-    get_bucket_indices(ft, hash, &bucket1, &bucket2);
-
-    //check the slot
-    //fist bucket
-    for(int i = 0; i<BUCKET_SIZE; i++)
-    {
-        if(ft->buckets[bucket1].entries[i].occupied && same_flow_key(&ft->buckets[bucket1].entries[i].key, key))
-        {
-            if(ft->buckets[bucket1].entries[i].expiration_time > current_time)
-            {
-                *replica = ft->buckets[bucket1].entries[i].replica;
-                return 1;
-            }
-            else
-            {
-                ft->buckets[bucket1].entries[i].occupied = 0;
-                continue;
-            }
-        }
-    }
-    //second bucket
-    for(int i = 0; i<BUCKET_SIZE; i++)
-    {
-        if(ft->buckets[bucket2].entries[i].occupied && same_flow_key(&ft->buckets[bucket2].entries[i].key, key))
-        {
-            if(ft->buckets[bucket2].entries[i].expiration_time > current_time)
-            {
-                *replica = ft->buckets[bucket2].entries[i].replica;
-                return 1;
-            }
-            else
-            {
-                ft->buckets[bucket2].entries[i].occupied = 0;
-                return 0;
-            }
-        }
-    }
-    return 0;
+/* An entry is free for an insert if it is empty or has expired (expired entries are reclaimed lazily). */
+static inline int slot_free(const flow_entry_t *e, uint64_t now)
+{
+    return !e->occupied || e->expiration_time <= now;
 }
 
-int ft_insert(flow_table_t *ft, flow_key_t *key, uint32_t replica,uint64_t hash, uint64_t expiration_time, uint64_t current_time){
+static inline void write_entry(flow_entry_t *e, const flow_key_t *key, uint32_t replica, uint8_t state,
+                               uint64_t expiration_time)
+{
+    e->key = *key;
+    e->replica = replica;
+    e->state = state;
+    e->expiration_time = expiration_time;
+    e->occupied = 1;
+}
 
-    uint32_t bucket1, bucket2;
-    get_bucket_indices(ft, hash, &bucket1, &bucket2);
+flow_entry_t *ft_find(flow_table_t *ft, const flow_key_t *key, uint64_t hash, uint64_t current_time){
 
-    for(int i = 0; i<BUCKET_SIZE; i++)
+    uint32_t buckets[2];
+    get_bucket_indices(ft, hash, &buckets[0], &buckets[1]);
+
+    //check the two buckets of the key; a key is stored at most once
+    for(int b = 0; b < 2; b++)
     {
-        if(!ft->buckets[bucket1].entries[i].occupied)
+        flow_bucket_t *bucket = &ft->buckets[buckets[b]];
+        for(int i = 0; i<BUCKET_SIZE; i++)
         {
-            ft->buckets[bucket1].entries[i].key = *key;
-            ft->buckets[bucket1].entries[i].replica = replica;
-            ft->buckets[bucket1].entries[i].expiration_time = expiration_time;
-            ft->buckets[bucket1].entries[i].occupied = 1;
-            return 1;
+            flow_entry_t *e = &bucket->entries[i];
+            if(e->occupied && same_flow_key(&e->key, key))
+            {
+                if(e->expiration_time > current_time)
+                    return e;
+                e->occupied = 0; //expired: free the slot
+                return NULL;
+            }
         }
     }
-    for(int i = 0; i<BUCKET_SIZE; i++)
+    return NULL;
+}
+
+int ft_insert(flow_table_t *ft, const flow_key_t *key, uint32_t replica, uint8_t state, uint64_t hash,
+              uint64_t expiration_time, uint64_t current_time){
+
+    uint32_t buckets[2];
+    get_bucket_indices(ft, hash, &buckets[0], &buckets[1]);
+
+    //the key already stored (live or expired): update it in place, never store it twice
+    //otherwise remember the first free or expired slot, bucket1 first
+    flow_entry_t *free_entry = NULL;
+    for(int b = 0; b < 2; b++)
     {
-        if(!ft->buckets[bucket2].entries[i].occupied)
+        flow_bucket_t *bucket = &ft->buckets[buckets[b]];
+        for(int i = 0; i<BUCKET_SIZE; i++)
         {
-            ft->buckets[bucket2].entries[i].key = *key;
-            ft->buckets[bucket2].entries[i].replica = replica;
-            ft->buckets[bucket2].entries[i].expiration_time = expiration_time;
-            ft->buckets[bucket2].entries[i].occupied = 1;
-            return 1;
+            flow_entry_t *e = &bucket->entries[i];
+            if(e->occupied && same_flow_key(&e->key, key))
+            {
+                write_entry(e, key, replica, state, expiration_time);
+                return 1;
+            }
+            if(!free_entry && slot_free(e, current_time))
+                free_entry = e;
         }
     }
+    if(free_entry)
+    {
+        write_entry(free_entry, key, replica, state, expiration_time);
+        return 1;
+    }
+
+    //both buckets full of live entries: displace entries (cuckoo), within a bounded search
     dfs_state_t path[MAX_DEPTH];
 
     int path_depth = 0;
     uint32_t free_bucket = 0;
     uint32_t free_slot = 0;
-    int found = ft_cuuko_DFS(ft, path, bucket1, 0, &path_depth, &free_bucket, &free_slot);
+    int budget = FT_DFS_BUDGET;
+    int found = ft_cuuko_DFS(ft, path, buckets[0], 0, &path_depth, &free_bucket, &free_slot, current_time, &budget);
 
     if (!found)
     {
-        found = ft_cuuko_DFS(ft, path, bucket2, 0,&path_depth, &free_bucket, &free_slot);
+        found = ft_cuuko_DFS(ft, path, buckets[1], 0, &path_depth, &free_bucket, &free_slot, current_time, &budget);
     }
 
     if (!found)
@@ -147,11 +151,8 @@ int ft_insert(flow_table_t *ft, flow_key_t *key, uint32_t replica,uint64_t hash,
         free_bucket = src_bucket;
         free_slot = src_slot;
     }
-    
-    ft->buckets[free_bucket].entries[free_slot].key = *key;
-    ft->buckets[free_bucket].entries[free_slot].replica = replica;
-    ft->buckets[free_bucket].entries[free_slot].expiration_time = expiration_time;
-    ft->buckets[free_bucket].entries[free_slot].occupied = 1;
+
+    write_entry(&ft->buckets[free_bucket].entries[free_slot], key, replica, state, expiration_time);
     return 1;
 }
 
@@ -164,7 +165,7 @@ key1: pointer to the first flow key
 key2: pointer to the second flow key
 Return: 1 if the two flow keys are the same, 0 otherwise
 */
-int same_flow_key(flow_key_t *key1, flow_key_t *key2)
+static int same_flow_key(const flow_key_t *key1, const flow_key_t *key2)
 {
     return (key1->src_ip == key2->src_ip) &&
            (key1->dst_ip == key2->dst_ip) &&
@@ -174,22 +175,23 @@ int same_flow_key(flow_key_t *key1, flow_key_t *key2)
 }
 
 /*
-Function to find an empty slot in a bucket
+Function to find a free slot in a bucket: empty, or holding an expired entry
 Param:
 ft: pointer to the flow table
 bucket_index: index of the bucket to search for an empty slot
-Return: index of the empty slot if found, -1 otherwise
+current_time: current time in nanoseconds
+Return: index of the free slot if found, -1 otherwise
 */
-int find_empty_slot(flow_table_t *ft, uint32_t bucket_index)
+static int find_empty_slot(flow_table_t *ft, uint32_t bucket_index, uint64_t current_time)
 {
     for (int i = 0; i < BUCKET_SIZE; i++)
     {
-        if (!ft->buckets[bucket_index].entries[i].occupied)
+        if (slot_free(&ft->buckets[bucket_index].entries[i], current_time))
         {
-            return i; // Return the index of the empty slot
+            return i; // Return the index of the free slot
         }
     }
-    return -1; // No empty slot found
+    return -1; // No free slot found
 }
 
 /*
@@ -200,7 +202,7 @@ depth: current depth of the search
 bucket_index: index of the bucket to check
 Return: 1 if the slot is in the path, 0 otherwise
 */
-int is_in_path(dfs_state_t *path, int depth, uint32_t bucket_index)
+static int is_in_path(dfs_state_t *path, int depth, uint32_t bucket_index)
 {
     for (int i = 0; i < depth; i++)
     {
@@ -213,27 +215,34 @@ int is_in_path(dfs_state_t *path, int depth, uint32_t bucket_index)
 }
 
 /*
-Function to perform a depth-first search for an empty slot in the flow table
+Function to perform a depth-first search for a free slot in the flow table
 Param:
 ft: pointer to the flow table
 bucket_index: index of the current bucket to search
 depth: current depth of the search
-Return: 1 if an empty slot is found, 0 otherwise
+current_time: current time in nanoseconds (expired entries count as free)
+budget: entries the search may still examine; each one costs a hash, so a full table costs at most this much
+Return: 1 if a free slot is found, 0 otherwise
 */
-int ft_cuuko_DFS(flow_table_t *ft,dfs_state_t *path, uint32_t bucket_index, int depth,int *path_depth, uint32_t *free_bucket, uint32_t *free_slot){
+static int ft_cuuko_DFS(flow_table_t *ft,dfs_state_t *path, uint32_t bucket_index, int depth,int *path_depth,
+                        uint32_t *free_bucket, uint32_t *free_slot, uint64_t current_time, int *budget){
 
-    int slot_index = find_empty_slot(ft, bucket_index);
+    int slot_index = find_empty_slot(ft, bucket_index, current_time);
     if(slot_index != -1){
         *path_depth = depth;
         *free_bucket = bucket_index;
         *free_slot = slot_index;
-        return 1; // Found an empty slot
+        return 1; // Found a free slot
     }
 
     if(depth >= MAX_DEPTH)
         return 0;
 
     for(int i = 0; i < BUCKET_SIZE; i++){
+        if(*budget <= 0)
+            return 0; // search budget spent: give up
+        (*budget)--;
+
         flow_entry_t *entry = &ft->buckets[bucket_index].entries[i];
 
         uint64_t hash = compute_hash(ft->hashfn, ft->th, ft->seed, &entry->key);
@@ -254,17 +263,13 @@ int ft_cuuko_DFS(flow_table_t *ft,dfs_state_t *path, uint32_t bucket_index, int 
         path[depth].entry_index = i;
 
         if(!is_in_path(path, depth+1, other_bucket)){
-            if(ft_cuuko_DFS(ft, path, other_bucket, depth + 1,path_depth, free_bucket, free_slot)){
+            if(ft_cuuko_DFS(ft, path, other_bucket, depth + 1,path_depth, free_bucket, free_slot, current_time, budget)){
                 return 1;
             }
         }
+    }
 
-        
-
-        
-    } 
-    
-    return 0; // No empty slot found in this path
+    return 0; // No free slot found in this path
 
 }
 

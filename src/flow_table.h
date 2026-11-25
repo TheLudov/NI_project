@@ -11,11 +11,12 @@
 
 
 //struct to represent a flow entry in the flow table
+//field order: 32 bytes (two entries per cache line) instead of 40 with the key first
 typedef struct {
+    uint64_t expiration_time; // expiration time for the flow entry (trace time, ns)
     flow_key_t key; //id of the connexion
-    uint32_t replica;//choosen server for the flow
-    uint64_t expiration_time; // expiration time for the flow entry
-    uint8_t state; //state  of the flow (TCP/UDP)
+    uint32_t replica;//choosen server for the flow: its replica id in the service's ring (ring_replica_id)
+    uint8_t state; //state of the flow: half-open, established, closing (lb/main.c)
     uint8_t occupied; //indicates if the entry is occupied or not
 }flow_entry_t;
 
@@ -48,24 +49,29 @@ flow_table_t *ft_init(gen_t *g, uint32_t Bucket_number, uint8_t hashfn, const ta
 Param:
 ft: pointer to the flow table
 key: pointer to the flow key
-replica: pointer to the replica variable
 hash: hash value of the flow key
 current_time: current time in nanoseconds
-Return: 1 if the flow is found, 0 otherwise
+Return: pointer to the live entry of the flow (the caller may read and update it until the next ft_insert,
+        which can move entries), or NULL if the flow is not in the table. An expired entry of the flow is freed.
 */
-int ft_lookup(flow_table_t *ft, flow_key_t *key, uint32_t *replica, uint64_t hash, uint64_t current_time);
+flow_entry_t *ft_find(flow_table_t *ft, const flow_key_t *key, uint64_t hash, uint64_t current_time);
 
 
-/*Function to insert a new flow entry
+/*Function to insert or update a flow entry (upsert)
 Param:
 ft: pointer to the flow table
 key: pointer to the flow key
-replica: replica value to be inserted
+replica: replica id to be stored
+state: state of the flow
 hash: hash value of the flow key
 expiration_time: expiration time for the flow entry in nanoseconds
-Return: 1 if the insertion is successful, 0 otherwise
+current_time: current time in nanoseconds: entries expired at this time count as free slots
+The slot already holding the key is overwritten; otherwise a free or expired slot of the key's two buckets is
+used; otherwise entries are displaced (at most MAX_DEPTH moves, FT_DFS_BUDGET entries examined).
+Return: 1 if the entry is stored, 0 otherwise
 */
-int ft_insert(flow_table_t *ft, flow_key_t *key, uint32_t replica,uint64_t hash, uint64_t expiration_time, uint64_t current_time);
+int ft_insert(flow_table_t *ft, const flow_key_t *key, uint32_t replica, uint8_t state, uint64_t hash,
+              uint64_t expiration_time, uint64_t current_time);
 
 
 #endif // FLOW_TABLE_H
