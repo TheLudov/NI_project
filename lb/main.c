@@ -24,8 +24,7 @@
 #include "crc32c.h"
 #include "tabhash.h"
 
-/* Flow hash function, chosen with the param hashfn=tab (default) or hashfn=crc (the E2 baseline). */
-enum { HASH_TAB, HASH_CRC };
+
 
 struct lb {
     gen_config_t cfg; // copy of gen_config_t

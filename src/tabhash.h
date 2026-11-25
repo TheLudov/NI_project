@@ -19,6 +19,9 @@
 
 #define TABHASH_KEY_BYTES 13
 
+/* Flow hash function, chosen with the param hashfn=tab (default) or hashfn=crc (the E2 baseline). */
+enum { HASH_TAB, HASH_CRC };
+
 typedef struct {
     uint64_t t[TABHASH_KEY_BYTES][256];
 } tabhash_t;

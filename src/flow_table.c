@@ -11,9 +11,10 @@ int same_flow_key(flow_key_t *key1, flow_key_t *key2);
 int find_empty_slot(flow_table_t *ft, uint32_t bucket_index);
 int is_in_path(dfs_state_t *path, int depth, uint32_t bucket_index);
 int ft_cuuko_DFS(flow_table_t *ft, dfs_state_t *path, uint32_t bucket_index, int depth, int *path_depth, uint32_t *free_bucket, uint32_t *free_slot);
+static void get_bucket_indices(flow_table_t *ft, uint64_t hash, uint32_t *bucket1, uint32_t *bucket2);
 
 
-flow_table_t *ft_init(gen_t *g, uint32_t Bucket_number)
+flow_table_t *ft_init(gen_t *g, uint32_t Bucket_number, uint8_t hashfn)
 {
     if(Bucket_number <2)
         return NULL;
@@ -25,6 +26,7 @@ flow_table_t *ft_init(gen_t *g, uint32_t Bucket_number)
 
 
     ft->num_buckets = Bucket_number;
+    ft->hashfn = hashfn;
     ft->buckets = (flow_bucket_t *) gen_alloc(g, sizeof(flow_bucket_t) * Bucket_number, 0, 0);
 
     if(ft->buckets == NULL)
@@ -48,16 +50,10 @@ flow_table_t *ft_init(gen_t *g, uint32_t Bucket_number)
 
 
 
-int ft_lookup(flow_table_t *ft, flow_key_t *key, uint32_t *replica, uint32_t hash, uint64_t current_time){
+int ft_lookup(flow_table_t *ft, flow_key_t *key, uint32_t *replica, uint64_t hash, uint64_t current_time){
 
-    uint32_t bucket1 = hash % ft->num_buckets;
-
-    uint32_t hash2 = crc32c_u64(
-        ~0u,
-        ((uint64_t)hash << 32) | hash
-    );
-
-    uint32_t bucket2 = (bucket1 + 1 + hash2 % (ft->num_buckets - 1)) % ft->num_buckets;
+    uint32_t bucket1, bucket2;
+    get_bucket_indices(ft, hash, &bucket1, &bucket2);
 
     //check the slot
     //fist bucket
@@ -97,16 +93,10 @@ int ft_lookup(flow_table_t *ft, flow_key_t *key, uint32_t *replica, uint32_t has
     return 0;
 }
 
-int ft_insert(flow_table_t *ft, flow_key_t *key, uint32_t replica,uint32_t hash, uint64_t expiration_time, uint64_t current_time){
+int ft_insert(flow_table_t *ft, flow_key_t *key, uint32_t replica,uint64_t hash, uint64_t expiration_time, uint64_t current_time){
 
-    uint32_t bucket1 = hash % ft->num_buckets;
-
-    uint32_t hash2 = crc32c_u64(
-        ~0u,
-        ((uint64_t)hash << 32) | hash
-    );
-
-    uint32_t bucket2 = (bucket1 + 1 + hash2 % (ft->num_buckets - 1)) % ft->num_buckets;
+    uint32_t bucket1, bucket2;
+    get_bucket_indices(ft, hash, &bucket1, &bucket2);
 
     for(int i = 0; i<BUCKET_SIZE; i++)
     {
@@ -276,4 +266,28 @@ int ft_cuuko_DFS(flow_table_t *ft,dfs_state_t *path, uint32_t bucket_index, int 
     
     return 0; // No empty slot found in this path
 
+}
+
+/*
+Fnction to get the two bucket indices for a given hash value
+Param:
+ft: pointer to the flow table
+hash: hash value of the flow key
+bucket1: pointer to store the first bucket index
+bucket2: pointer to store the second bucket index
+Return: void
+*/
+static void get_bucket_indices(flow_table_t *ft, uint64_t hash, uint32_t *bucket1, uint32_t *bucket2){
+
+    if(ft->hashfn == HASH_TAB){
+        *bucket1 = (uint32_t) hash % ft->num_buckets;
+        *bucket2 = (uint32_t)((*bucket1 + 1 + (hash >> 32) % (ft->num_buckets - 1)) % ft->num_buckets);
+    }
+    else{
+       *bucket1 = hash % ft->num_buckets;
+
+        uint32_t hash2 = crc32c_u64( ~0u, ((uint64_t)hash << 32) | hash);
+
+        *bucket2 = (*bucket1 + 1 + hash2 % (ft->num_buckets - 1)) % ft->num_buckets;
+    }
 }
