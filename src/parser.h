@@ -1,5 +1,5 @@
 //
-// Created by belgae on 20/11/26.
+// Created by Ludovic on 20/11/26.
 //
 
 #ifndef NI_PROJECT_PARSER_H
