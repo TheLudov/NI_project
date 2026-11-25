@@ -22,6 +22,7 @@
 #include "parser.h"
 #include "ring.h"
 #include "crc32c.h"
+#include "flow_table.h"
 #include "tabhash.h"
 
 
@@ -29,7 +30,7 @@
 struct lb {
     gen_config_t cfg; // copy of gen_config_t
     ring_t *rings;    /* one consistent-hash ring per service, cfg.services[k] -> rings[k] (Atieh) */
-    // TODO: define flow table, hash table
+    flow_table_t *ft; /* cuckoo flow table (Samuel) */
     tabhash_t *th;    /* simple tabulation hashing tables, filled from cfg.seed */
     uint8_t hashfn;   /* HASH_TAB or HASH_CRC */
 };
@@ -77,16 +78,25 @@ static lb_t *init(gen_t *g, const gen_config_t *cfg)
     } else if (strcmp(hf, "crc") == 0) {
         lb->hashfn = HASH_CRC;
     } else {
-        fprintf(stderr, "bad hashfn=%s: tab or crc\n", hf);
-        exit(1);
+        init_fail("bad hashfn value: tab or crc");
     }
 
     lb->th = gen_alloc(g, sizeof(tabhash_t), 64, 0);
     if (!lb->th) {
-        fprintf(stderr, "gen_alloc for the tabulation tables failed\n");
-        exit(1);
+        init_fail("gen_alloc for the tabulation tables failed");
     }
     tabhash_init(lb->th, cfg->seed);
+
+    const char* pb = gen_param(g, "ft_buckets");
+    char *endb = NULL;
+    unsigned long nb = pb ? strtoul(pb, &endb, 10) : 32768;
+    if (nb < 2 || nb > UINT32_MAX || (pb && (endb == pb || *endb != '\0'))) {
+        init_fail("ft_buckets must be a whole number");
+    }
+    lb->ft = ft_init(g, (uint32_t)nb, lb->hashfn, lb->th, cfg->seed);
+    if (!lb->ft) {
+        init_fail("Flow table initialization failed (ft_buckets too large for memory budget?");
+    }
     return lb;
 }
 
@@ -100,19 +110,6 @@ static void on_event(lb_t *lb, const gen_event_t *ev)
     if (!ring_event(&lb->rings[ev->service], (int)ev->type, ev->ipv4))
         fprintf(stderr, "ring: gen_alloc failed on a replica event (service %u, type %d): ring not updated\n",
                 ev->service, (int)ev->type);
-}
-
-/* CRC32C of the 5-tuple, seeded: the E2 baseline (32 bits, zero-extended). */
-static inline uint64_t crc_flow(uint64_t seed, const flow_key_t *key)
-{
-    uint64_t ips = ((uint64_t)key->src_ip << 32) | key->dst_ip;
-    uint32_t ports = ((uint32_t)key->src_port << 16) | key->dst_port;
-
-    uint32_t h = crc32c_u64(~0u, seed);
-    h = crc32c_u64(h, ips);
-    h = crc32c_u32(h, ports);
-    h = crc32c_u8(h, key->protocol);
-    return h;
 }
 
 /*Made By ludovic and next modify by samuel*/

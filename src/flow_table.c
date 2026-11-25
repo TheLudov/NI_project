@@ -37,7 +37,7 @@ flow_table_t *ft_init(gen_t *g, uint32_t Bucket_number, uint8_t hashfn, const ta
         return NULL;
     }
 
-    for(int i = 0; i< Bucket_number; i++)
+    for(uint32_t i = 0; i < Bucket_number; i++)
     {
         for(int j = 0; j<BUCKET_SIZE; j++)
         {

@@ -32,15 +32,7 @@ uint64_t tabhash_flow(const tabhash_t *th, const flow_key_t *k) {
          ^ th->t[12][k->protocol];
 }
 
-uint64_t compute_hash(uint8_t hashfn, const tabhash_t *th, uint64_t seed, const flow_key_t *key){
-    if (hashfn == HASH_TAB)
-        return tabhash_flow(th, key);
-    else
-        return crc_flow(seed, key);
-}
-
-
-static inline uint64_t crc_flow(uint64_t seed,const flow_key_t *key)
+uint64_t crc_flow(uint64_t seed,const flow_key_t *key)
 {
     uint64_t ips = ((uint64_t)key->src_ip << 32)
                    | key->dst_ip;
@@ -55,3 +47,11 @@ static inline uint64_t crc_flow(uint64_t seed,const flow_key_t *key)
 
     return h;
 }
+
+uint64_t compute_hash(uint8_t hashfn, const tabhash_t *th, uint64_t seed, const flow_key_t *key){
+    if (hashfn == HASH_TAB)
+        return tabhash_flow(th, key);
+    return crc_flow(seed, key);
+}
+
+

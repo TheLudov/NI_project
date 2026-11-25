@@ -1,1 +1,1 @@
-hashfn=tab;ring_v=100
+hashfn=tab,ring_v=100,ft_buckets=32768
