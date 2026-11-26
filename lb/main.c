@@ -52,11 +52,6 @@ struct pkt_state {
     uint8_t valid;
 };
 
-static inline uint64_t timeout_of(const lb_t *lb, uint32_t svc, uint8_t st)
-{
-    const svc_timeouts_t *t = &lb->to[svc];
-    return st == FS_HALF_OPEN ? t->half : st == FS_CLOSING ? t->fin : t->est;
-}
 
 /* State of a flow inserted on this packet: a SYN opens it, a FIN or RST closes it, anything else is a flow
    already in progress (from another LB, or evicted earlier). UDP has no handshake: established. */
@@ -127,6 +122,7 @@ static void init_timeouts(gen_t *g, lb_t *lb)
     }
 }
 
+//modify by Sam
 static lb_t *init(gen_t *g, const gen_config_t *cfg)
 {
     lb_t *lb = gen_alloc(g, sizeof(lb_t), 0, 0);
@@ -237,6 +233,7 @@ static void hash(lb_t *lb, pkt_t **p, uint8_t n,
  *     miss too. A retransmitted SYN is a new-flow decision: without this, a SYN whose replica failed
  *     silently and was then drained is sent to a draining replica (44 misplaced flows on events.scn).
  *   With neither check, tests/failover.scn and tests/churn.scn fail (52 and 83 misplaced flows). */
+ //modify by sam 
 static uint64_t lookup(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, uint64_t mask)
 {
     uint64_t hit = 0;
@@ -303,6 +300,7 @@ static uint64_t compute_replica(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, 
    evicted earlier), and flows whose stored replica lookup rejected. ft_insert is an upsert, so two packets of one
    new flow in the same batch (same hash, same ring: same replica) store a single entry. A failed insert only
    clears the packet's bit: the main loop forwards it anyway, by consistent hashing (brief, item 5). */
+//modify by sam
 static uint64_t insert(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, uint64_t mask)
 {
     uint64_t stored = 0;

@@ -355,7 +355,7 @@ static int find_expired_slot(flow_table_t *ft, uint32_t bucket_index, uint64_t c
     uint32_t *bucket = bucket_at(ft, bucket_index);
     for (uint32_t i = 0; i < ft->bucket_size; i++)
     {
-        if (is_expired(ft, slot_entry(ft, bucket[i]), current_time))
+        if (bucket[i] != 0 && is_expired(ft, slot_entry(ft, bucket[i]), current_time))
             return i;
     }
     return -1;
