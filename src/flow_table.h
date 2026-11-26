@@ -76,6 +76,8 @@ typedef struct {
     uint64_t seed; // seed for initializing the hash tables
     ft_stats_t stats; // ft_find's counters (stay 0 when FT_STATS is 0)
     const svc_timeouts_t *timeouts; // pointer to the service timeouts (lb/main.c)
+    uint8_t insert_policy; // insertion policy: 0 for First available, 1 for least loaded, 2 for random
+    uint64_t rng_state; // state of the random number generator for the random insertion policy
 }flow_table_t;
 
 

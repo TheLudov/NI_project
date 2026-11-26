@@ -178,6 +178,7 @@ static lb_t *init(gen_t *g, const gen_config_t *cfg)
     uint32_t dfs = (uint32_t)param_ul(g, "dfs_budget", 64, 2, 100000);
     // signature width: 0 = every bit the entry index leaves free
     uint8_t sb = (uint8_t)param_ul(g, "sig_bits", 0, 0, FT_MAX_SIG_BITS);
+    uint8_t ip = (uint8_t)param_ul(g, "insert_policy", 0, 0, 2);
 
     init_timeouts(g, lb);
 
@@ -187,6 +188,7 @@ static lb_t *init(gen_t *g, const gen_config_t *cfg)
     if (!lb->ft) {
         init_fail("flow table initialization failed");
     }
+    lb->ft->insert_policy = ip;
 
     /* Prefetching (E1, Atieh): off unless the params turn it on, so that it can be measured on and off */
     lb->pf_pkt = (uint8_t)param_ul(g, "pf_pkt", 0, 0, 1);
