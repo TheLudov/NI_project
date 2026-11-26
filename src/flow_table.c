@@ -541,3 +541,20 @@ static void get_bucket_indices(const flow_table_t *ft, uint64_t hash, uint32_t *
     *bucket1 = b1;
     *bucket2 = b2;
 }
+
+/* E5 occupancy probe (Ludovic): see flow_table.h */
+void ft_occupancy(const flow_table_t *ft, uint64_t now, uint32_t n_svc, uint64_t *live, uint64_t *expired)
+{
+    memset(live, 0, (size_t)n_svc * 3 * sizeof *live);
+    *expired = 0;
+    for (uint32_t i = 0; i < ft->capacity; i++) {
+        uint32_t s = ft->slots[i];
+        if (!s)
+            continue;
+        const flow_entry_t *e = slot_entry(ft, s);
+        if (is_expired(ft, e, now))
+            (*expired)++;
+        else if (e->service_id < n_svc && e->state <= FS_CLOSING)
+            live[3 * e->service_id + e->state]++;
+    }
+}
