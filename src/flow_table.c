@@ -312,9 +312,6 @@ int ft_insert_at(flow_table_t *ft, const flow_key_t *key, uint32_t replica, uint
 
         if (!found)
             return 0;
-#if FT_STATS
-        ft->stats.displacements += (uint64_t)path_depth;
-#endif
 
         //the free slot found may hold an expired entry: free it before a slot is moved onto it
         slot_release(ft, &bucket_at(ft, free_bucket)[free_slot]);
@@ -340,9 +337,6 @@ int ft_insert_at(flow_table_t *ft, const flow_key_t *key, uint32_t replica, uint
     uint32_t idx = entry_alloc(ft);
     write_entry(&ft->entries[idx], key, replica, state, service_id, current_time);
     *target = make_slot(ft, sig, idx);
-#if FT_STATS
-    ft->stats.inserts++;
-#endif
     return 1;
 }
 

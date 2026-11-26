@@ -37,8 +37,6 @@ typedef struct {
     uint64_t slots_checked; // non-empty slots whose signature was compared with the key's
     uint64_t sig_matches; // of those, same signature: the entry array was read
     uint64_t false_matches; // of those, another flow's key (signature collision)
-    uint64_t inserts; // ft_insert_at calls that stored a new entry (E2: displacements per insert)
-    uint64_t displacements; // slots moved by those inserts' cuckoo paths
 } ft_stats_t;
 
 //struct to represent a flow entry in the flow table (one element of the entry array)
