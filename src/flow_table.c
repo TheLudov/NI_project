@@ -14,7 +14,7 @@ static int find_expired_slot(flow_table_t *ft, uint32_t bucket_index, uint64_t c
 static int find_empty_slot(flow_table_t *ft, uint32_t bucket_index, uint64_t current_time);
 static int is_in_path(dfs_state_t *path, int depth, uint32_t bucket_index);
 static int ft_cuuko_DFS(flow_table_t *ft, dfs_state_t *path, uint32_t bucket_index, uint32_t depth, int *path_depth, uint32_t *free_bucket, uint32_t *free_slot, uint64_t current_time, int *budget);
-static void get_bucket_indices(flow_table_t *ft, uint64_t hash, uint32_t *bucket1, uint32_t *bucket2);
+static void get_bucket_indices(const flow_table_t *ft, uint64_t hash, uint32_t *bucket1, uint32_t *bucket2);
 static int is_expired(const flow_table_t *ft,const flow_entry_t *entry,uint64_t current_time);
 
 /* ---- the cuckoo index: slots ---- */
@@ -24,12 +24,19 @@ static inline uint32_t *bucket_at(const flow_table_t *ft, uint32_t bucket_index)
     return ft->slots + (size_t)bucket_index * ft->bucket_size;
 }
 
-/* The signature of a key: the top sig_bits bits of the low 32 bits of its hash. Two keys may share one: the full
+/* The signature of a key: the low sig_bits bits of the low 32 bits of its hash. Two keys may share one: the full
  * key decides. Low half, because crc_flow gives only 32 bits (the top of the 64 would always be 0) and because
- * tabulation's second bucket uses the high half (get_bucket_indices). The first bucket uses the low log2(num_buckets)
- * bits, so the two are disjoint when num_buckets is a power of two and log2(num_buckets) + sig_bits <= 32. */
+ * tabulation's second bucket uses the high half (get_bucket_indices). The first bucket is (lo * num_buckets) >> 32,
+ * which depends on the top log2(num_buckets) bits of the same 32 (Atieh: multiply-shift instead of a modulo), so the
+ * two are disjoint when log2(num_buckets) + sig_bits <= 32, which the automatic width (sig_bits = 0) guarantees. */
 static inline uint32_t sig_of(const flow_table_t *ft, uint64_t hash) {
-    return (uint32_t)hash >> (32 - ft->sig_bits);
+    return (uint32_t)hash & ((1u << ft->sig_bits) - 1);
+}
+
+/* Maps x, uniform over 32 bits, onto [0, n): (x * n) >> 32 spreads it like x % n would, with a multiplication instead
+ * of a division (Atieh: the three divisions of the two bucket indices cost ~9 ns a key on our VM, this ~2 ns). */
+static inline uint32_t reduce(uint32_t x, uint32_t n) {
+    return (uint32_t)(((uint64_t)x * n) >> 32);
 }
 
 /* The signature held in a non-empty slot */
@@ -148,11 +155,25 @@ static inline void write_entry(flow_entry_t *e, const flow_key_t *key, uint32_t 
     e->service_id = service_id;
 }
 
-flow_entry_t *ft_find(flow_table_t *ft, const flow_key_t *key, uint64_t hash, uint64_t current_time){
+/* Where a key can be: its two buckets and its signature (Atieh: computed once per packet, in the LB's hash stage,
+   then reused by the prefetches, the lookup and the insert; the bucket indices cost three divisions) */
+void ft_locate(const flow_table_t *ft, uint64_t hash, ft_loc_t *loc)
+{
+    get_bucket_indices(ft, hash, &loc->bucket[0], &loc->bucket[1]);
+    loc->sig = sig_of(ft, hash);
+}
 
-    uint32_t buckets[2];
-    get_bucket_indices(ft, hash, &buckets[0], &buckets[1]);
-    uint32_t sig = sig_of(ft, hash);
+flow_entry_t *ft_find(flow_table_t *ft, const flow_key_t *key, uint64_t hash, uint64_t current_time)
+{
+    ft_loc_t loc;
+    ft_locate(ft, hash, &loc);
+    return ft_find_at(ft, key, &loc, current_time);
+}
+
+flow_entry_t *ft_find_at(flow_table_t *ft, const flow_key_t *key, const ft_loc_t *loc, uint64_t current_time){
+
+    const uint32_t *buckets = loc->bucket;
+    uint32_t sig = loc->sig;
 #if FT_STATS
     ft->stats.lookups++;
 #endif
@@ -195,12 +216,49 @@ flow_entry_t *ft_find(flow_table_t *ft, const flow_key_t *key, uint64_t hash, ui
     return NULL;
 }
 
-int ft_insert(flow_table_t *ft, const flow_key_t *key, uint32_t replica, uint8_t state, uint64_t hash,
-              uint32_t service_id, uint64_t current_time){
+/* ---- prefetching (E1), by Atieh ---- */
 
-    uint32_t buckets[2];
-    get_bucket_indices(ft, hash, &buckets[0], &buckets[1]);
-    uint32_t sig = sig_of(ft, hash);
+/* Asks the CPU to start loading every cache line of [p, p + bytes) and returns at once, without waiting */
+static inline void prefetch_range(const void *p, size_t bytes)
+{
+    const char *line = (const char *)((uintptr_t)p & ~(uintptr_t)63);
+    const char *end = (const char *)p + bytes;
+    for (; line < end; line += 64)
+        __builtin_prefetch(line);
+}
+
+void ft_prefetch_buckets(const flow_table_t *ft, const ft_loc_t *loc, int both)
+{
+    prefetch_range(bucket_at(ft, loc->bucket[0]), ft->bucket_size * sizeof(uint32_t));
+    if (both)
+        prefetch_range(bucket_at(ft, loc->bucket[1]), ft->bucket_size * sizeof(uint32_t));
+}
+
+void ft_prefetch_entries(const flow_table_t *ft, const ft_loc_t *loc, int both)
+{
+    for (int b = 0; b < (both ? 2 : 1); b++) {
+        const uint32_t *bucket = bucket_at(ft, loc->bucket[b]);
+        for (uint32_t i = 0; i < ft->bucket_size; i++) {
+            uint32_t s = bucket[i];
+            if (s != 0 && slot_sig(ft, s) == loc->sig)
+                prefetch_range(slot_entry(ft, s), sizeof(flow_entry_t)); /* an entry may span two lines */
+        }
+    }
+}
+
+int ft_insert(flow_table_t *ft, const flow_key_t *key, uint32_t replica, uint8_t state, uint64_t hash,
+              uint32_t service_id, uint64_t current_time)
+{
+    ft_loc_t loc;
+    ft_locate(ft, hash, &loc);
+    return ft_insert_at(ft, key, replica, state, &loc, service_id, current_time);
+}
+
+int ft_insert_at(flow_table_t *ft, const flow_key_t *key, uint32_t replica, uint8_t state, const ft_loc_t *loc,
+                 uint32_t service_id, uint64_t current_time){
+
+    const uint32_t *buckets = loc->bucket;
+    uint32_t sig = loc->sig;
 
     //the key already stored (live or expired): update its entry in place, never store it twice
     //otherwise remember the first empty slot, bucket1 first (the index alone tells it, no entry is read)
@@ -471,17 +529,15 @@ bucket1: pointer to store the first bucket index
 bucket2: pointer to store the second bucket index
 Return: void
 */
-static void get_bucket_indices(flow_table_t *ft, uint64_t hash, uint32_t *bucket1, uint32_t *bucket2){
+static void get_bucket_indices(const flow_table_t *ft, uint64_t hash, uint32_t *bucket1, uint32_t *bucket2){
 
-    if(ft->hashfn == HASH_TAB){
-        *bucket1 = (uint32_t) hash % ft->num_buckets;
-        *bucket2 = (uint32_t)((*bucket1 + 1 + (hash >> 32) % (ft->num_buckets - 1)) % ft->num_buckets);
-    }
-    else{
-       *bucket1 = (uint32_t) hash % ft->num_buckets;
-
-        uint32_t hash2 = crc32c_u64( ~0u, ((uint64_t)hash << 32) | hash);
-
-        *bucket2 = (*bucket1 + 1 + hash2 % (ft->num_buckets - 1)) % ft->num_buckets;
-    }
+    // the second bucket's offset: tabulation's high 32 bits; crc_flow has only 32 bits, so a second CRC of them
+    uint32_t hi = ft->hashfn == HASH_TAB ? (uint32_t)(hash >> 32)
+                                         : crc32c_u64(~0u, ((uint64_t)hash << 32) | hash);
+    uint32_t b1 = reduce((uint32_t)hash, ft->num_buckets);
+    uint32_t b2 = b1 + 1 + reduce(hi, ft->num_buckets - 1); // 1 .. num_buckets - 1 after b1: never b1 itself
+    if (b2 >= ft->num_buckets)
+        b2 -= ft->num_buckets;
+    *bucket1 = b1;
+    *bucket2 = b2;
 }

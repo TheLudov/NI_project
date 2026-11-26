@@ -42,10 +42,27 @@ struct lb {
     tabhash_t *th;    /* simple tabulation hashing tables, filled from cfg.seed */
     uint8_t hashfn;   /* HASH_TAB or HASH_CRC */
     svc_timeouts_t *to; /* timeouts per service, indexed by service_id */
+    /* Prefetching (E1, Atieh): where the stages ask the CPU to load cache lines ahead, each 0 (off) or on:
+       pf_pkt=1 the packet headers hash parses; pf_bucket=1 the first bucket of the index lookup reads, =2 both
+       buckets; pf_entry=1 the entries the first bucket points to with the key's signature, =2 those of both
+       buckets. And how far ahead, pf_dist: 0 = a stage first asks for its whole batch, then works on it; D > 0 =
+       while it works on packet i it asks for packet i + D (buckets for i + 2D when pf_entry needs them first), so
+       that at most a few packets' lines are on their way at once. */
+    uint8_t pf_pkt, pf_bucket, pf_entry;
+    uint32_t pf_dist;
 };
+
+/* pf_pkt (Atieh): the 54 bytes of Ethernet + IPv4 + TCP headers from off, which may span two cache lines */
+static inline void prefetch_headers(const pkt_t *pk)
+{
+    const uint8_t *f = pk->buf + pk->off;
+    __builtin_prefetch(f);
+    __builtin_prefetch(f + 53);
+}
 struct pkt_state {
     flow_key_t key;
     uint64_t hash;
+    ft_loc_t loc;   /* the key's buckets and signature, from the hash, computed once in hash() (Atieh) */
     uint32_t replica;
     uint32_t service_id;
     uint8_t tcp_flags;
@@ -170,6 +187,12 @@ static lb_t *init(gen_t *g, const gen_config_t *cfg)
     if (!lb->ft) {
         init_fail("flow table initialization failed");
     }
+
+    /* Prefetching (E1, Atieh): off unless the params turn it on, so that it can be measured on and off */
+    lb->pf_pkt = (uint8_t)param_ul(g, "pf_pkt", 0, 0, 1);
+    lb->pf_bucket = (uint8_t)param_ul(g, "pf_bucket", 0, 0, 2);
+    lb->pf_entry = (uint8_t)param_ul(g, "pf_entry", 0, 0, 2);
+    lb->pf_dist = (uint32_t)param_ul(g, "pf_dist", 0, 0, 64);
     return lb;
 }
 
@@ -190,7 +213,20 @@ static void on_event(lb_t *lb, const gen_event_t *ev)
 static void hash(lb_t *lb, pkt_t **p, uint8_t n,
                  pkt_state_t *s, uint64_t mask)
 {
+    /* pf_pkt (Atieh): the packet buffers live in a pool far larger than the cache, so reading each packet's headers
+       is a cache miss. Ask for them ahead (all of them first with pf_dist=0, else pf_dist packets ahead); the loop
+       then parses packets whose headers are already on their way. */
+    uint32_t d = lb->pf_dist;
+    if (lb->pf_pkt) {
+        uint32_t first = d == 0 || d > n ? n : d;
+        for (uint32_t i = 0; i < first; i++)
+            if (mask & (1ull << i))
+                prefetch_headers(p[i]);
+    }
+
     for (uint8_t i = 0; i < n; i++) {
+        if (lb->pf_pkt && d && i + d < n && (mask & (1ull << (i + d))))
+            prefetch_headers(p[i + d]);
         if (!(mask & (1ull << i)))
             continue;
 
@@ -220,6 +256,14 @@ static void hash(lb_t *lb, pkt_t **p, uint8_t n,
             continue;
         // Hash the 5-tuple: simple tabulation (default) or CRC32C (baseline)
         s[i].hash = lb->hashfn == HASH_TAB ? tabhash_flow(lb->th, key) : crc_flow(lb->cfg.seed, key);
+
+        /* Where the key can be in the flow table, once for lookup, insert and the prefetches (Atieh) */
+        ft_locate(lb->ft, s[i].hash, &s[i].loc);
+
+        /* pf_bucket with pf_dist=0 (Atieh): the two buckets lookup will read for this packet, asked for now so that
+           they arrive while hash works on the rest of the batch (with pf_dist > 0, lookup asks for them) */
+        if (lb->pf_bucket && d == 0)
+            ft_prefetch_buckets(lb->ft, &s[i].loc, lb->pf_bucket == 2);
     }
 }
 
@@ -236,12 +280,37 @@ static void hash(lb_t *lb, pkt_t **p, uint8_t n,
  //modify by sam 
 static uint64_t lookup(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, uint64_t mask)
 {
+    /* Prefetching (Atieh). pf_dist=0: pf_entry reads every packet's buckets first (in cache already with pf_bucket,
+       which hash asked for) and asks for the entries they point to with its signature; the loop then finds them
+       arriving or arrived. pf_dist=D: while it looks packet i up, it asks for the buckets of packet i + D (of
+       i + 2D with pf_entry, so that they have arrived when the entries of that packet are asked for, D packets
+       later) and for the entries of packet i + D. */
+    uint32_t d = lb->pf_dist;
+    uint32_t bd = lb->pf_entry ? 2 * d : d;
+#define PF_OK(j) ((j) < n && (mask & (1ull << (j))) && s[(j)].valid)
+    if (d == 0) {
+        if (lb->pf_entry)
+            for (uint32_t i = 0; i < n; i++)
+                if (PF_OK(i))
+                    ft_prefetch_entries(lb->ft, &s[i].loc, lb->pf_entry == 2);
+    } else if (lb->pf_bucket) {
+        for (uint32_t i = 0; i < bd && i < n; i++)
+            if (PF_OK(i))
+                ft_prefetch_buckets(lb->ft, &s[i].loc, lb->pf_bucket == 2);
+    }
+
     uint64_t hit = 0;
     for (uint8_t i = 0; i < n; i++) {
+        if (d) {
+            if (lb->pf_bucket && PF_OK(i + bd))
+                ft_prefetch_buckets(lb->ft, &s[i + bd].loc, lb->pf_bucket == 2);
+            if (lb->pf_entry && PF_OK(i + d))
+                ft_prefetch_entries(lb->ft, &s[i + d].loc, lb->pf_entry == 2);
+        }
         if (!(mask & (1ull << i)) || !s[i].valid)
             continue;
         uint64_t now = p[i]->ts_ns;
-        flow_entry_t *e = ft_find(lb->ft, &s[i].key, s[i].hash, now);
+        flow_entry_t *e = ft_find_at(lb->ft, &s[i].key, &s[i].loc, now);
         if (!e)
             continue;                                       /* miss: not in the table, or expired */
 
@@ -279,6 +348,7 @@ static uint64_t lookup(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, uint64_t 
         }
         hit |= 1ull << i;
     }
+#undef PF_OK
     return hit;
 }
 
@@ -318,7 +388,7 @@ static uint64_t insert(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, uint64_t 
         uint64_t now = p[i]->ts_ns;
         uint8_t st = first_state(&s[i]);
 
-        if (ft_insert(lb->ft, &s[i].key, id, st, s[i].hash,
+        if (ft_insert_at(lb->ft, &s[i].key, id, st, &s[i].loc,
                     svc, now))
             stored |= 1ull << i;
     }
