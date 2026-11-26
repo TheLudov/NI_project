@@ -546,7 +546,8 @@ static void get_bucket_indices(const flow_table_t *ft, uint64_t hash, uint32_t *
    displacement search found no room. Instead of forwarding the flow without an entry, one entry of the key's two
    buckets gives its slot up: policy 1, the one seen longest ago; policy 2, a half-open one first (a SYN not yet
    answered: cheap to lose, and what a SYN flood fills the table with), then a closing one, then the one seen longest
-   ago. The victim's entry is reused in place and its slot gets the new key's signature, so nothing moves or is
+   ago; policy 3, the one seen longest ago among the key's own service's entries (in a shared table, one service's
+   new flows, a SYN flood's for instance, then never evict another service's flows). The victim's entry is reused in place and its slot gets the new key's signature, so nothing moves or is
    allocated. The evicted flow is not broken at once: its next packet is a miss, and consistent hashing sends it to
    the same replica unless the ring changed meanwhile. Returns 1 if the key is stored. */
 int ft_evict_insert_at(flow_table_t *ft, const flow_key_t *key, uint32_t replica, uint8_t state,
@@ -561,6 +562,8 @@ int ft_evict_insert_at(flow_table_t *ft, const flow_key_t *key, uint32_t replica
             if (!bucket[i])
                 continue;
             const flow_entry_t *e = slot_entry(ft, bucket[i]);
+            if (policy == 3 && e->service_id != service_id)
+                continue;                          /* only the key's own service's entries */
             int rank = policy == 2 ? (e->state == FS_HALF_OPEN ? 0 : e->state == FS_CLOSING ? 1 : 2) : 2;
             if (rank < victim_rank || (rank == victim_rank && e->last_seen < victim_seen)) {
                 victim = &bucket[i];

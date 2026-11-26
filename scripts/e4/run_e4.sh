@@ -9,10 +9,12 @@
 #               evictions.
 #   saturation  packet rate of each service (2-minute traces) for batch = 8, 16, 32, 64; and video and web with a
 #               table sized for them instead of the autotuner's.
-#   events      events.scn in saturation mode with profile=1, with and without its replica events: the time the LB
-#               spends in on_event.
+#   events      events.scn in saturation mode with profile=1, with and without its replica events, and with them
+#               coalesced (ev_coalesce=1): the time the LB spends in on_event, and in hash, where coalesced events are
+#               applied.
 #   paced       latency (median, p99) and RX drops at 50, 80 and 95 % of each saturation rate, for each batch size;
-#               and events.scn with and without its events at the same loads. Needs the saturation and events
+#               and events.scn with its events, coalesced or not, and without them, at the same loads. Needs the
+#               saturation and events
 #               results, and a machine where the harness keeps the pace (pace_valid = 1): not a small VM.
 #
 #   scripts/e4/run_e4.sh [GROUPS] [SEEDS]   GROUPS: comma-separated (default functional,saturation,events); SEEDS: 5
@@ -37,6 +39,7 @@ one() {
     fi
     if [ -s "$OUT/raw/$1.part" ]; then
         [ -f "$OUT/raw/$1.part.series.csv" ] && mv "$OUT/raw/$1.part.series.csv" "$OUT/raw/$1.series.csv"
+        [ -f "$OUT/raw/$1.part.latency.csv" ] && mv "$OUT/raw/$1.part.latency.csv" "$OUT/raw/$1.latency.csv"
         mv "$OUT/raw/$1.part" "$OUT/raw/$1.csv"
         echo "  $1" >&2
     else
@@ -145,8 +148,9 @@ if has events; then
     echo "events: time spent in on_event (saturation, profile=1), with and without the replica events" >&2
     for seed in $(seq_seeds); do
         for v in events events_none; do
-            one "e_sat__${v}__s$seed" "$v" "$P,seed=$seed,mode=saturation,profile=1" 1 build/lb
+            one "e_sat__${v}__s$seed" "$v" "$(pset "$P" ev_coalesce 0),seed=$seed,mode=saturation,profile=1" 1 build/lb
         done
+        one "e_sat__events_coalesce__s$seed" events "$(pset "$P" ev_coalesce 1),seed=$seed,mode=saturation,profile=1" 1 build/lb
     done
 fi
 
@@ -179,10 +183,13 @@ if has paced; then
     done
     SAT=$(median_pps "$OUT/raw/e_sat__events__s*.csv")
     if [ -n "$SAT" ]; then
-        for v in events events_none; do
+        for v in events events_none events_coalesce; do
+            scn=$v; ev=0
+            [ "$v" = events_coalesce ] && { scn=events; ev=1; }
             for load in 0.5 0.8 0.95; do
                 for seed in $(seq_seeds); do
-                    one "pe__${v}__l${load}__s$seed" "$v" "$P,seed=$seed,mode=paced,load=$load,sat_pps=$SAT" 1 build/lb
+                    one "pe__${v}__l${load}__s$seed" "$scn" \
+                        "$(pset "$P" ev_coalesce $ev),seed=$seed,mode=paced,load=$load,sat_pps=$SAT" 1 build/lb
                 done
             done
         done

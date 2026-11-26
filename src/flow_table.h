@@ -138,8 +138,8 @@ int ft_insert_at(flow_table_t *ft, const flow_key_t *key, uint32_t replica, uint
 
 /* E4 (Atieh): the fallback after a failed ft_insert_at (lb/main.c, ins_fallback): an entry of the key's two buckets
    gives its slot to the key. policy 1: the entry seen longest ago; policy 2: a half-open entry first, then a closing
-   one, then the entry seen longest ago. Return: 1 if stored (0 only if both buckets are empty, which a failed insert
-   rules out). */
+   one, then the entry seen longest ago; policy 3: the entry seen longest ago among the key's own service's. Return: 1
+   if stored, 0 if no entry may give its slot up (policy 3: none of the key's service). */
 int ft_evict_insert_at(flow_table_t *ft, const flow_key_t *key, uint32_t replica, uint8_t state,
                        const ft_loc_t *loc, uint32_t service_id, uint64_t current_time, int policy);
 /* Prefetching (E1, by Atieh). These two only ask the CPU to start loading cache lines (__builtin_prefetch) and

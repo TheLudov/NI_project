@@ -15,6 +15,14 @@
  *   - a replica joining the active set: its v points are generated, sorted, and merged in, O(P + v log v);
  * where P is the number of points on the ring. No full rebuild after the initial one.
  *
+ * E4 (event cost): after ring_enable_coalescing, ring_event_defer only records the change (replica states change
+ * at once, O(1)); ring_flush then applies every change recorded since the last flush together: one pass removes the points of all the
+ * replicas that left, and the points of up to RING_CHUNK replicas that joined are sorted and merged in one pass.
+ * A rolling upgrade's wave (dozens of replicas drained, or added, at the same instant) thus costs O(P) once
+ * instead of once per replica. Without coalescing, ring_event works as before. The LB defers when
+ * ev_coalesce=1 and flushes at the start of each batch's hash stage, before any ring_lookup: the main LB and the
+ * harness's copy both do, so their rings stay the same.
+ *
  * Memory: ring_init reserves room for the replica churn of the published scenarios (every initial replica
  * replaced once by a fresh address, plus a 25 % scale-out), so on_event does not allocate in those runs.
  * If it ever has to (more churn than that), it grows the arrays; should gen_alloc then fail on the main LB but
@@ -51,8 +59,24 @@ typedef struct {
     ring_point_t *pts;    /* the points of the active replicas, sorted by (h, ip) */
     uint32_t n_pts, cap_pts;
 
-    ring_point_t *scratch; /* v points: the new points of one replica, before the merge */
+    ring_point_t *scratch; /* v points (RING_CHUNK * v with coalescing): new points, before the merge */
+    /* Changes recorded by ring_event_defer, applied by ring_flush (E4) */
+    uint8_t  *pflags;     /* per replica id: RING_IN (its points are in pts), RING_ADD (waiting to be added) */
+    uint32_t *rm_ips;     /* replicas whose points are in pts but must go (left the active set) */
+    uint32_t n_rm;
+    uint32_t *add_ids;    /* replicas whose points must be added (joined the active set) */
+    uint32_t n_add;
+    uint32_t *rm_set;     /* RING_RM_SET slots: rm_ips as an open-addressing set, for the removal pass */
+    uint8_t  dirty;       /* something is recorded: ring_lookup needs a ring_flush first */
+    uint8_t  coalesce;    /* ring_enable_coalescing was called */
 } ring_t;
+
+#define RING_CHUNK 16     /* replicas whose points are merged in one pass */
+#define RING_RM_MAX 256   /* removals recorded before a flush is forced */
+#define RING_ADD_MAX 256  /* additions recorded before a flush is forced */
+#define RING_RM_SET 512   /* power of two, at least twice RING_RM_MAX */
+#define RING_IN 1
+#define RING_ADD 2
 
 /* Builds the ring of one service from its initial replicas. Returns 1 on success, 0 if gen_alloc fails. */
 int ring_init(ring_t *r, gen_t *g, const service_t *svc, uint32_t v, uint64_t seed);
@@ -60,6 +84,15 @@ int ring_init(ring_t *r, gen_t *g, const service_t *svc, uint32_t v, uint64_t se
 /* Applies a replica event (REPLICA_ADD, REPLICA_DRAIN, REPLICA_DOWN, REPLICA_UP).
  * Returns 1 on success, 0 if gen_alloc fails; the ring and the replica table are then left unchanged. */
 int ring_event(ring_t *r, int type, uint32_t ipv4);
+/* E4: makes ring_event_defer record events instead of applying them (allocates the room: RING_CHUNK * v points
+ * and a few small arrays). Returns 0 if gen_alloc fails (the ring then stays as it was). */
+int ring_enable_coalescing(ring_t *r);
+/* After ring_enable_coalescing: the same as ring_event, but the points only move at the next ring_flush: the
+ * replica's state changes at once. Until then ring_lookup must not be called (r->dirty). Without coalescing it is
+ * ring_event. */
+int ring_event_defer(ring_t *r, int type, uint32_t ipv4);
+/* Applies every change recorded since the last flush; nothing to do if !r->dirty. */
+void ring_flush(ring_t *r);
 
 /* Number of active replicas (replicas with points on the ring). */
 uint32_t ring_n_active(const ring_t *r);

@@ -78,6 +78,10 @@ static void ring_free(ring_t *r)
     gen_mfree(NULL, r->reps);
     gen_mfree(NULL, r->idmap);
     gen_mfree(NULL, r->scratch);
+    gen_mfree(NULL, r->pflags);
+    gen_mfree(NULL, r->rm_ips);
+    gen_mfree(NULL, r->add_ids);
+    gen_mfree(NULL, r->rm_set);
 }
 
 /* ---- the workload ---- */

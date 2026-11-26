@@ -59,9 +59,15 @@ struct lb {
     uint32_t pf_dist;
     /* E4 (Atieh): batch = packets taken from the receive ring at a time (1..64, default 64); ins_fallback = what a
        failed insert does: 0 (default) forward the flow by consistent hashing without an entry, 1 evict the entry
-       of the key's buckets seen longest ago, 2 evict a half-open one first, then a closing one, then the oldest
-       (ft_evict_insert_at). */
-    uint8_t batch, ins_fallback;
+       of the key's buckets seen longest ago, 2 evict a half-open one first, then a closing one, then the oldest,
+       3 evict the oldest of the key's own service (ft_evict_insert_at). ins_fallback_<VIP> sets it for one service
+       (E4 found that the best one differs). */
+    uint8_t batch;
+    uint8_t fallback[16];     /* ins_fallback per service, by service id (at most 15 services) */
+    /* E4 (Atieh, event cost): ev_coalesce=1 records replica events (ring_event_defer) and applies them together at
+       the start of the next batch's hash stage (ring_flush), so a wave of events costs one pass over the ring
+       instead of one per event. 0 (default): each event is applied at once. */
+    uint8_t ev_coalesce;
 #if E4_STATS
     uint64_t e4_evict[16]; /* evictions per service (E4_STATS builds only) */
 #endif
@@ -180,6 +186,10 @@ static lb_t *init(gen_t *g, const gen_config_t *cfg)
         if (!ring_init(&lb->rings[k], g, &cfg->services[k], vk, cfg->seed))
             init_fail("gen_alloc for a service's ring failed (ring_v too large for the memory budget?)");
     }
+    lb->ev_coalesce = (uint8_t)param_ul(g, "ev_coalesce", 0, 0, 1);
+    for (uint32_t k = 0; lb->ev_coalesce && k < cfg->n_services; k++)
+        if (!ring_enable_coalescing(&lb->rings[k]))
+            init_fail("gen_alloc for event coalescing failed");
 
     const char *hf = gen_param(g, "hashfn");
     if (!hf || strcmp(hf, "tab") == 0) {
@@ -218,7 +228,17 @@ static lb_t *init(gen_t *g, const gen_config_t *cfg)
     lb->pf_entry = (uint8_t)param_ul(g, "pf_entry", 0, 0, 2);
     lb->pf_dist = (uint32_t)param_ul(g, "pf_dist", 0, 0, 64);
     lb->batch = (uint8_t)param_ul(g, "batch", 64, 1, 64);
-    lb->ins_fallback = (uint8_t)param_ul(g, "ins_fallback", 0, 0, 2);
+    uint8_t fb = (uint8_t)param_ul(g, "ins_fallback", 0, 0, 3);
+    for (uint32_t k = 0; k < 16; k++) {
+        lb->fallback[k] = fb;
+        if (k < cfg->n_services) {
+            uint32_t vip = cfg->services[k].vip;
+            char key[48];
+            snprintf(key, sizeof key, "ins_fallback_%u.%u.%u.%u", vip >> 24, (vip >> 16) & 0xff, (vip >> 8) & 0xff,
+                     vip & 0xff);
+            lb->fallback[k] = (uint8_t)param_ul(g, key, fb, 0, 3);
+        }
+    }
     return lb;
 }
 
@@ -229,7 +249,8 @@ static void on_event(lb_t *lb, const gen_event_t *ev)
         return;
     /* ring_init reserved room for the published scenarios' churn, so this does not allocate there. If it
        has to and gen_alloc fails, this instance's ring no longer matches the copy's: say so loudly. */
-    if (!ring_event(&lb->rings[ev->service], (int)ev->type, ev->ipv4))
+    ring_t *r = &lb->rings[ev->service];
+    if (!(lb->ev_coalesce ? ring_event_defer(r, (int)ev->type, ev->ipv4) : ring_event(r, (int)ev->type, ev->ipv4)))
         fprintf(stderr, "ring: gen_alloc failed on a replica event (service %u, type %d): ring not updated\n",
                 ev->service, (int)ev->type);
 }
@@ -239,6 +260,11 @@ static void on_event(lb_t *lb, const gen_event_t *ev)
 static void hash(lb_t *lb, pkt_t **p, uint8_t n,
                  pkt_state_t *s, uint64_t mask)
 {
+    /* ev_coalesce (E4): the replica events recorded since the last batch move the ring's points now, together,
+       before lookup and compute_replica use them (the harness's copy calls hash first too) */
+    if (lb->ev_coalesce)
+        for (uint32_t k = 0; k < lb->cfg.n_services; k++)
+            ring_flush(&lb->rings[k]);
     /* pf_pkt (Atieh): the packet buffers live in a pool far larger than the cache, so reading each packet's headers
        is a cache miss. Ask for them ahead (all of them first with pf_dist=0, else pf_dist packets ahead); the loop
        then parses packets whose headers are already on their way. */
@@ -417,8 +443,8 @@ static uint64_t insert(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, uint64_t 
         if (ft_insert_at(lb->ft, &s[i].key, id, st, &s[i].loc,
                     svc, now))
             stored |= 1ull << i;
-        else if (lb->ins_fallback &&
-                 ft_evict_insert_at(lb->ft, &s[i].key, id, st, &s[i].loc, svc, now, lb->ins_fallback)) {
+        else if (svc < 16 && lb->fallback[svc] &&
+                 ft_evict_insert_at(lb->ft, &s[i].key, id, st, &s[i].loc, svc, now, lb->fallback[svc])) {
             stored |= 1ull << i;
 #if E4_STATS
             if (svc < 16)
