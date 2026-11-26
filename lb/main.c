@@ -502,6 +502,47 @@ int main(int argc, char **argv)
             ft->sig_bits, ft->num_buckets, ft->bucket_size, ft->capacity, (unsigned long long)used,
             (unsigned long long)st->lookups, (unsigned long long)st->hits, (unsigned long long)st->slots_checked,
             (unsigned long long)st->sig_matches, (unsigned long long)st->false_matches);
+
+    fprintf(stderr, "\n--- E1 statistics ---\n");
+
+    fprintf(stderr, "Occupied slots: %u / %u\n",
+            st->occupied_slots, ft->capacity);
+
+    if (st->first_failure_seen)
+    {
+        double load_factor =
+            100.0 * st->first_failure_occupied / ft->capacity;
+
+        fprintf(stderr, "First failure occupied: %u\n",
+                st->first_failure_occupied);
+
+        fprintf(stderr, "First failure load factor: %.2f%%\n",
+                load_factor);
+    }
+    else
+    {
+        fprintf(stderr, "No insertion failure\n");
+    }
+
+    fprintf(stderr, "\nLoad range,Insertions,Displacements,Average\n");
+
+    for (int i = 0; i < 10; i++)
+    {
+        double average = 0.0;
+
+        if (st->insertions_by_load[i] > 0)
+        {
+            average = (double)st->displacements_by_load[i]
+                    / st->insertions_by_load[i];
+        }
+
+        fprintf(stderr, "%d-%d%%,%llu,%llu,%.6f\n",
+                i * 10,
+                (i + 1) * 10,
+                (unsigned long long)st->insertions_by_load[i],
+                (unsigned long long)st->displacements_by_load[i],
+                average);
+    }
 #endif
     gen_close(g);
     return 0;

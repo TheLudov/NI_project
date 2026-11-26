@@ -64,12 +64,18 @@ static inline flow_entry_t *slot_entry(const flow_table_t *ft, uint32_t slot) {
 static inline uint32_t entry_alloc(flow_table_t *ft) {
     uint32_t idx = ft->free_head;
     ft->free_head = ft->entries[idx].replica;
+#if FT_STATS
+    ft->stats.occupied_slots++;
+#endif
     return idx;
 }
 
 static inline void entry_free(flow_table_t *ft, uint32_t idx) {
     ft->entries[idx].replica = ft->free_head;
     ft->free_head = idx;
+#if FT_STATS
+    ft->stats.occupied_slots--;
+#endif
 }
 
 /* Empties a slot, returning its entry (if any) to the free list */
@@ -257,6 +263,13 @@ int ft_insert(flow_table_t *ft, const flow_key_t *key, uint32_t replica, uint8_t
 int ft_insert_at(flow_table_t *ft, const flow_key_t *key, uint32_t replica, uint8_t state, const ft_loc_t *loc,
                  uint32_t service_id, uint64_t current_time){
 
+#if FT_STATS
+    uint32_t load_index =
+        ((uint64_t)ft->stats.occupied_slots * 10) / ft->capacity;
+
+    if (load_index >= 10)
+        load_index = 9;
+#endif
     const uint32_t *buckets = loc->bucket;
     uint32_t sig = loc->sig;
 
@@ -293,13 +306,13 @@ int ft_insert_at(flow_table_t *ft, const flow_key_t *key, uint32_t replica, uint
         if(i >= 0)
             target = &bucket_at(ft, buckets[b])[i];
     }
-
+    int path_depth = 0;
     if(!target)
     {
         //both buckets full of live entries: displace slots (cuckoo), within a bounded search
         dfs_state_t path[ft->max_depth];
 
-        int path_depth = 0;
+        
         uint32_t free_bucket = 0;
         uint32_t free_slot = 0;
         int budget = ft->dfs_budget;
@@ -310,8 +323,15 @@ int ft_insert_at(flow_table_t *ft, const flow_key_t *key, uint32_t replica, uint
             found = ft_cuuko_DFS(ft, path, buckets[1], 0, &path_depth, &free_bucket, &free_slot, current_time, &budget);
         }
 
-        if (!found)
+        if (!found){
+#if FT_STATS
+            if(ft->stats.first_failure_seen == 0){
+                ft->stats.first_failure_occupied = ft->stats.occupied_slots;
+                ft->stats.first_failure_seen = 1;
+            }
+#endif
             return 0;
+        }
 
         //the free slot found may hold an expired entry: free it before a slot is moved onto it
         slot_release(ft, &bucket_at(ft, free_bucket)[free_slot]);
@@ -337,6 +357,11 @@ int ft_insert_at(flow_table_t *ft, const flow_key_t *key, uint32_t replica, uint
     uint32_t idx = entry_alloc(ft);
     write_entry(&ft->entries[idx], key, replica, state, service_id, current_time);
     *target = make_slot(ft, sig, idx);
+
+#if FT_STATS
+    ft->stats.insertions_by_load[load_index]++;
+    ft->stats.displacements_by_load[load_index] += path_depth;
+#endif
     return 1;
 }
 
