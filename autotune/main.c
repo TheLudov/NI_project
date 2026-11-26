@@ -136,10 +136,13 @@ static void ft_free(gen_t *g, flow_table_t *ft)
     gen_mfree(g, ft);
 }
 
+/* The tuner's flows never expire: every timeout is as long as it can be, and the time stays 0 (one service, 0) */
+static const svc_timeouts_t NEVER_EXPIRE[1] = { { UINT64_MAX, UINT64_MAX, UINT64_MAX } };
+
 static flow_table_t *ft_new(gen_t *g, uint32_t nb, uint32_t bs, uint32_t depth, uint32_t budget,
                             const tabhash_t *th)
 {
-    flow_table_t *ft = ft_init(g, nb, bs, depth, budget, 0, HASH_TAB, th, 0);   /* sig_bits 0: automatic, as in the LB */
+    flow_table_t *ft = ft_init(g, nb, bs, depth, budget, 0, HASH_TAB, th, 0, NEVER_EXPIRE);  /* sig_bits 0: automatic, as in the LB */
     if (!ft) {
         fprintf(stderr, "autotune: ft_init(%u buckets x %u) failed: over the memory budget?\n", nb, bs);
         exit(1);
@@ -151,7 +154,7 @@ static flow_table_t *ft_new(gen_t *g, uint32_t nb, uint32_t bs, uint32_t depth, 
 static uint32_t fill_until_failure(flow_table_t *ft, const tkey_t *k, uint32_t n)
 {
     for (uint32_t i = 0; i < n; i++)
-        if (!ft_insert(ft, &k[i].key, 0, 1, k[i].hash, UINT64_MAX, 0))
+        if (!ft_insert(ft, &k[i].key, 0, 1, k[i].hash, 0, 0))
             return i;
     return n;
 }
@@ -254,10 +257,10 @@ int main(void)
 
             uint32_t pre = TARGET_FLOWS - N_INSERT;
             for (uint32_t i = 0; i < pre; i++)
-                ft_insert(ft, &keys[i].key, 0, 1, keys[i].hash, UINT64_MAX, 0);
+                ft_insert(ft, &keys[i].key, 0, 1, keys[i].hash, 0, 0);
             double t0 = now_ns();
             for (uint32_t i = pre; i < TARGET_FLOWS; i++)
-                sink += (uintptr_t)ft_insert(ft, &keys[i].key, 0, 1, keys[i].hash, UINT64_MAX, 0);
+                sink += (uintptr_t)ft_insert(ft, &keys[i].key, 0, 1, keys[i].hash, 0, 0);
             ti_v[c][r] = (now_ns() - t0) / N_INSERT;
 
             t0 = now_ns();
@@ -280,7 +283,7 @@ int main(void)
             uint32_t n_try = 0, n_fail = 0;
             t0 = now_ns();
             for (uint32_t i = at; i < at + N_OVER && i < n_keys; i++, n_try++)
-                n_fail += !ft_insert(ft, &keys[i].key, 0, 1, keys[i].hash, UINT64_MAX, 0);
+                n_fail += !ft_insert(ft, &keys[i].key, 0, 1, keys[i].hash, 0, 0);
             tf_v[c][r] = n_try ? (now_ns() - t0) / n_try : 0;
             ff_v[c][r] = n_try ? (double)n_fail / n_try : 0;
 
