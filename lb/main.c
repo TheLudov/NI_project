@@ -29,18 +29,11 @@
 #define TCP_RST 0x04
 #define TCP_ACK 0x10
 
-/* Flow states, kept in flow_entry_t.state (brief, item 2: half-open, established, closing). */
-enum { FS_HALF_OPEN, FS_ESTABLISHED, FS_CLOSING };
 
 /* A connection's first packet: SYN set, ACK not set (a SYN-ACK never reaches the LB: replies bypass it). */
 static inline int is_syn(uint8_t f) { return (f & (TCP_SYN | TCP_ACK)) == TCP_SYN; }
 
-/* Idle timeouts of one service, per state, in ns of trace time. */
-typedef struct {
-    uint64_t half;    /* half-open: SYN seen, no ACK yet */
-    uint64_t est;     /* established (also a UDP flow, and a TCP flow first seen mid-flow) */
-    uint64_t fin;     /* closing: grace period after a FIN or RST, never extended */
-} svc_timeouts_t;
+
 
 struct lb {
     gen_config_t cfg; // copy of gen_config_t
@@ -173,13 +166,14 @@ static lb_t *init(gen_t *g, const gen_config_t *cfg)
     // signature width: 0 = every bit the entry index leaves free
     uint8_t sb = (uint8_t)param_ul(g, "sig_bits", 0, 0, FT_MAX_SIG_BITS);
 
-    lb->ft = ft_init(g, nb, bs, md, dfs, sb, lb->hashfn, lb->th, cfg->seed);
-    if (!lb->ft) {
-        init_fail("flow table initialization failed (ft_buckets * bucket_size too large for the memory budget, "
-                  "or sig_bits too wide for the bits the entry index leaves free?)");
-    }
-
     init_timeouts(g, lb);
+
+    lb->ft = ft_init(g, nb, bs, md, dfs, sb,
+                    lb->hashfn, lb->th, cfg->seed, lb->to);
+
+    if (!lb->ft) {
+        init_fail("flow table initialization failed");
+    }
     return lb;
 }
 
@@ -269,16 +263,19 @@ static uint64_t lookup(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, uint64_t 
         if (s[i].key.protocol == 6 && (f & (TCP_FIN | TCP_RST))) {
             if (e->state != FS_CLOSING) {
                 e->state = FS_CLOSING;
-                e->expiration_time = now + timeout_of(lb, s[i].service_id, FS_CLOSING);
+                e->CLOSED_timeout = now;
             }
-        } else if (syn) {                                   /* a retransmitted SYN, or the 5-tuple reused */
+        } else if (syn) {
             e->state = FS_HALF_OPEN;
-            e->expiration_time = now + timeout_of(lb, s[i].service_id, FS_HALF_OPEN);
         } else if (e->state != FS_CLOSING) {
-            if (e->state == FS_HALF_OPEN && (s[i].key.protocol != 6 || (f & TCP_ACK)))
+            if (e->state == FS_HALF_OPEN &&
+                (s[i].key.protocol != 6 || (f & TCP_ACK))) {
                 e->state = FS_ESTABLISHED;
-            e->expiration_time = now + timeout_of(lb, s[i].service_id, e->state);
+            }
         }
+
+        if (now > e->last_seen)
+            e->last_seen = now;
         hit |= 1ull << i;
     }
     return hit;
@@ -318,7 +315,9 @@ static uint64_t insert(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, uint64_t 
             continue;                       /* cannot happen: compute_replica returns a replica of the ring */
         uint64_t now = p[i]->ts_ns;
         uint8_t st = first_state(&s[i]);
-        if (ft_insert(lb->ft, &s[i].key, id, st, s[i].hash, now + timeout_of(lb, svc, st), now))
+
+        if (ft_insert(lb->ft, &s[i].key, id, st, s[i].hash,
+                    svc, now))
             stored |= 1ull << i;
     }
     return stored;

@@ -13,9 +13,9 @@ static int same_flow_key(const flow_key_t *key1, const flow_key_t *key2);
 static int find_expired_slot(flow_table_t *ft, uint32_t bucket_index, uint64_t current_time);
 static int find_empty_slot(flow_table_t *ft, uint32_t bucket_index, uint64_t current_time);
 static int is_in_path(dfs_state_t *path, int depth, uint32_t bucket_index);
-static int ft_cuuko_DFS(flow_table_t *ft, dfs_state_t *path, uint32_t bucket_index, uint32_t depth, int *path_depth,
-                        uint32_t *free_bucket, uint32_t *free_slot, uint64_t current_time, int *budget);
+static int ft_cuuko_DFS(flow_table_t *ft, dfs_state_t *path, uint32_t bucket_index, uint32_t depth, int *path_depth, uint32_t *free_bucket, uint32_t *free_slot, uint64_t current_time, int *budget);
 static void get_bucket_indices(flow_table_t *ft, uint64_t hash, uint32_t *bucket1, uint32_t *bucket2);
+static int is_expired(const flow_table_t *ft,const flow_entry_t *entry,uint64_t current_time);
 
 /* ---- the cuckoo index: slots ---- */
 
@@ -75,7 +75,7 @@ static inline void slot_release(flow_table_t *ft, uint32_t *slot) {
 
 
 flow_table_t *ft_init(gen_t *g, uint32_t num_buckets, uint32_t bucket_size, uint32_t max_depth, uint32_t dfs_budget,
-                      uint8_t sig_bits, uint8_t hashfn, const tabhash_t *th, uint64_t seed)
+                      uint8_t sig_bits, uint8_t hashfn, const tabhash_t *th, uint64_t seed, const svc_timeouts_t *timeouts)
 {
     // check if valide value
     if(num_buckets <2 || bucket_size == 0 || max_depth == 0 || sig_bits > FT_MAX_SIG_BITS)
@@ -113,7 +113,7 @@ flow_table_t *ft_init(gen_t *g, uint32_t num_buckets, uint32_t bucket_size, uint
     ft->capacity = (uint32_t)capacity;
     ft->sig_bits = sig_bits;
     memset(&ft->stats, 0, sizeof ft->stats);
-
+    ft->timeouts = timeouts;
     // 64-byte aligned, so that a bucket of 16 slots is exactly one cache line
     ft->slots = (uint32_t *) gen_alloc(g, (size_t)capacity * sizeof(uint32_t), 64, 0);
     ft->entries = (flow_entry_t *) gen_alloc(g, (size_t)capacity * sizeof(flow_entry_t), 64, 0);
@@ -139,13 +139,14 @@ flow_table_t *ft_init(gen_t *g, uint32_t num_buckets, uint32_t bucket_size, uint
 
 
 
-static inline void write_entry(flow_entry_t *e, const flow_key_t *key, uint32_t replica, uint8_t state,
-                               uint64_t expiration_time)
+static inline void write_entry(flow_entry_t *e, const flow_key_t *key, uint32_t replica, uint8_t state, uint64_t service_id, uint64_t current_time)
 {
     e->key = *key;
     e->replica = replica;
     e->state = state;
-    e->expiration_time = expiration_time;
+    e->last_seen = current_time;
+    e->service_id = service_id;
+    e->CLOSED_timeout = (state == FS_CLOSING) ? current_time : 0;
 }
 
 flow_entry_t *ft_find(flow_table_t *ft, const flow_key_t *key, uint64_t hash, uint64_t current_time){
@@ -182,7 +183,7 @@ flow_entry_t *ft_find(flow_table_t *ft, const flow_key_t *key, uint64_t hash, ui
 #endif
                 continue; //same signature, other flow
             }
-            if(e->expiration_time > current_time) {
+            if(!is_expired(ft, e, current_time)) {
 #if FT_STATS
                 ft->stats.hits++;
 #endif
@@ -196,7 +197,7 @@ flow_entry_t *ft_find(flow_table_t *ft, const flow_key_t *key, uint64_t hash, ui
 }
 
 int ft_insert(flow_table_t *ft, const flow_key_t *key, uint32_t replica, uint8_t state, uint64_t hash,
-              uint64_t expiration_time, uint64_t current_time){
+              uint32_t service_id, uint64_t current_time){
 
     uint32_t buckets[2];
     get_bucket_indices(ft, hash, &buckets[0], &buckets[1]);
@@ -222,7 +223,7 @@ int ft_insert(flow_table_t *ft, const flow_key_t *key, uint32_t replica, uint8_t
             flow_entry_t *e = slot_entry(ft, s);
             if(same_flow_key(&e->key, key))
             {
-                write_entry(e, key, replica, state, expiration_time);
+                write_entry(e, key, replica, state, service_id, current_time);
                 return 1;
             }
         }
@@ -277,12 +278,53 @@ int ft_insert(flow_table_t *ft, const flow_key_t *key, uint32_t replica, uint8_t
     //store: free the expired entry the slot may hold first, so that its entry can be the one taken
     slot_release(ft, target);
     uint32_t idx = entry_alloc(ft);
-    write_entry(&ft->entries[idx], key, replica, state, expiration_time);
+    write_entry(&ft->entries[idx], key, replica, state, service_id, current_time);
     *target = make_slot(ft, sig, idx);
     return 1;
 }
 
 
+/* ---- internal functions ---- */
+/*
+Function to check if an entry has expired
+Param:
+ft: pointer to the flow table
+entry: pointer to the flow entry
+current_time: current time in nanoseconds
+Return: 1 if the entry has expired, 0 otherwise
+*/
+static int is_expired(const flow_table_t *ft,
+                      const flow_entry_t *entry,
+                      uint64_t current_time)
+{
+    const svc_timeouts_t *to = &ft->timeouts[entry->service_id];
+
+    uint64_t timeout;
+    uint64_t reference_time = entry->last_seen;
+
+    switch (entry->state) {
+        case FS_HALF_OPEN:
+            timeout = to->half;
+            break;
+
+        case FS_ESTABLISHED:
+            timeout = to->est;
+            break;
+
+        case FS_CLOSING:
+            timeout = to->fin;
+            reference_time = entry->CLOSED_timeout;
+            break;
+
+        default:
+            return 1;
+    }
+
+    if (current_time < reference_time)
+        return 0;
+
+    return (current_time - reference_time) >= timeout;
+}
 
 /*
 Function to compare two flows
@@ -313,7 +355,7 @@ static int find_expired_slot(flow_table_t *ft, uint32_t bucket_index, uint64_t c
     uint32_t *bucket = bucket_at(ft, bucket_index);
     for (uint32_t i = 0; i < ft->bucket_size; i++)
     {
-        if (bucket[i] && slot_entry(ft, bucket[i])->expiration_time <= current_time)
+        if (is_expired(ft, slot_entry(ft, bucket[i]), current_time))
             return i;
     }
     return -1;

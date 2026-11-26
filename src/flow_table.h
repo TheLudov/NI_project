@@ -11,11 +11,24 @@
 #define FT_MIN_SIG_BITS 8 // fewest signature bits the automatic width (sig_bits = 0) may give (2^(32-8) - 1 entries at most)
 #define FT_MAX_SIG_BITS 31 // most signature bits: at least one bit is needed for the entry index
 
+
 // 1: ft_find counts its signature comparisons in ft->stats
 // 0 (default, the Makefile's build): no counting, nothing added to the lookup loop.
 #ifndef FT_STATS
 #define FT_STATS 0
 #endif
+
+/* Flow states, kept in flow_entry_t.state (brief, item 2: half-open, established, closing). */
+enum { FS_HALF_OPEN, FS_ESTABLISHED, FS_CLOSING };
+
+/*
+ * Service timeouts for different flow states.
+ */
+typedef struct {
+    uint64_t half;
+    uint64_t est;
+    uint64_t fin;
+} svc_timeouts_t;
 
 //counters of ft_find (only with FT_STATS)
 typedef struct {
@@ -31,10 +44,12 @@ typedef struct {
 //An entry is in use iff exactly one slot of the index refers to it; a free entry is on the free list, its replica
 //field then holding the index of the next free entry. Entries never move once stored.
 typedef struct {
-    uint64_t expiration_time; // expiration time for the flow entry (trace time, ns)
+    uint64_t last_seen; // last time the flow was seen (trace time, ns)
     flow_key_t key; //id of the connexion
     uint32_t replica;//choosen server for the flow: its replica id in the service's ring (ring_replica_id)
     uint8_t state; //state of the flow: half-open, established, closing (lb/main.c)
+    uint8_t service_id; //id of the service the flow belongs to (lb/main.c)
+    uint64_t CLOSED_timeout; //time when the flow will be closed (lb/main.c)
 }flow_entry_t;
 
 //struct to represent the flow table: a cuckoo index (slots) and an entry array (entries)
@@ -54,6 +69,7 @@ typedef struct {
     const tabhash_t *th; // pointer to the tabulation hash structure
     uint64_t seed; // seed for initializing the hash tables
     ft_stats_t stats; // ft_find's counters (stay 0 when FT_STATS is 0)
+    const svc_timeouts_t *timeouts; // pointer to the service timeouts (lb/main.c)
 }flow_table_t;
 
 
@@ -70,12 +86,13 @@ sig_bits: signature width in bits (E1 sweep). 0: automatic, every bit the entry 
 hashfn: hash function used for the flow table
 th: pointer to the hash table
 seed: seed used for the hash
+timeouts: pointer to the service timeouts (lb/main.c)
 Return: Pointer to the initialized flow table or NULL if the initialization fails (also when sig_bits does not fit
         next to the entry index, or, with sig_bits = 0, when the table is too large for a slot to keep at least
         FT_MIN_SIG_BITS signature bits, i.e. num_buckets * bucket_size >= 2^24)
 */
 flow_table_t *ft_init(gen_t *g, uint32_t num_buckets, uint32_t bucket_size, uint32_t max_depth, uint32_t dfs_budget,
-                      uint8_t sig_bits, uint8_t hashfn, const tabhash_t *th, uint64_t seed);
+                      uint8_t sig_bits, uint8_t hashfn, const tabhash_t *th, uint64_t seed, const svc_timeouts_t *timeouts);
 // hash function used for the flow table
 /*Function of look_up
 Param:
@@ -97,7 +114,7 @@ key: pointer to the flow key
 replica: replica id to be stored
 state: state of the flow
 hash: hash value of the flow key
-expiration_time: expiration time for the flow entry in nanoseconds
+service_id: id of the service the flow belongs to
 current_time: current time in nanoseconds: entries expired at this time count as free slots
 The entry already holding the key is overwritten; otherwise an empty slot of the key's two buckets is used, then a
 slot whose entry expired; otherwise slots are displaced (at most max_depth moves, dfs_budget slots examined). Only
@@ -105,7 +122,7 @@ the slots of the index move: entries stay where they are.
 Return: 1 if the entry is stored, 0 otherwise
 */
 int ft_insert(flow_table_t *ft, const flow_key_t *key, uint32_t replica, uint8_t state, uint64_t hash,
-              uint64_t expiration_time, uint64_t current_time);
+              uint32_t service_id, uint64_t current_time);
 
 
 #endif // FLOW_TABLE_H
