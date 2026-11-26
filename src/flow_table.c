@@ -541,3 +541,43 @@ static void get_bucket_indices(const flow_table_t *ft, uint64_t hash, uint32_t *
     *bucket1 = b1;
     *bucket2 = b2;
 }
+
+/* E4 (Atieh): the fallback when ft_insert_at fails, i.e. both of the key's buckets hold live entries and the
+   displacement search found no room. Instead of forwarding the flow without an entry, one entry of the key's two
+   buckets gives its slot up: policy 1, the one seen longest ago; policy 2, a half-open one first (a SYN not yet
+   answered: cheap to lose, and what a SYN flood fills the table with), then a closing one, then the one seen longest
+   ago. The victim's entry is reused in place and its slot gets the new key's signature, so nothing moves or is
+   allocated. The evicted flow is not broken at once: its next packet is a miss, and consistent hashing sends it to
+   the same replica unless the ring changed meanwhile. Returns 1 if the key is stored. */
+int ft_evict_insert_at(flow_table_t *ft, const flow_key_t *key, uint32_t replica, uint8_t state,
+                       const ft_loc_t *loc, uint32_t service_id, uint64_t current_time, int policy)
+{
+    uint32_t *victim = NULL;
+    int victim_rank = 3;
+    uint64_t victim_seen = UINT64_MAX;
+    for (int b = 0; b < 2; b++) {
+        uint32_t *bucket = bucket_at(ft, loc->bucket[b]);
+        for (uint32_t i = 0; i < ft->bucket_size; i++) {
+            if (!bucket[i])
+                continue;
+            const flow_entry_t *e = slot_entry(ft, bucket[i]);
+            int rank = policy == 2 ? (e->state == FS_HALF_OPEN ? 0 : e->state == FS_CLOSING ? 1 : 2) : 2;
+            if (rank < victim_rank || (rank == victim_rank && e->last_seen < victim_seen)) {
+                victim = &bucket[i];
+                victim_rank = rank;
+                victim_seen = e->last_seen;
+            }
+        }
+    }
+    if (!victim)
+        return 0;
+    uint32_t idx = slot_idx(ft, *victim);
+    flow_entry_t *e = &ft->entries[idx];
+    e->key = *key;
+    e->replica = replica;
+    e->state = state;
+    e->service_id = (uint8_t)service_id;
+    e->last_seen = current_time;
+    *victim = make_slot(ft, loc->sig, idx);
+    return 1;
+}

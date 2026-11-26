@@ -35,6 +35,13 @@ static inline int is_syn(uint8_t f) { return (f & (TCP_SYN | TCP_ACK)) == TCP_SY
 
 
 
+/* E4 (Atieh): -DE4_STATS=1 prints, once per second of trace time, each service's table entries by state and its
+   misses, new flows, failed inserts and evictions (scripts/e4/run_e4.sh). Off by default: nothing changes in the
+   normal build. */
+#ifndef E4_STATS
+#define E4_STATS 0
+#endif
+
 struct lb {
     gen_config_t cfg; // copy of gen_config_t
     ring_t *rings;    /* one consistent-hash ring per service, cfg.services[k] -> rings[k] (Atieh) */
@@ -50,6 +57,14 @@ struct lb {
        that at most a few packets' lines are on their way at once. */
     uint8_t pf_pkt, pf_bucket, pf_entry;
     uint32_t pf_dist;
+    /* E4 (Atieh): batch = packets taken from the receive ring at a time (1..64, default 64); ins_fallback = what a
+       failed insert does: 0 (default) forward the flow by consistent hashing without an entry, 1 evict the entry
+       of the key's buckets seen longest ago, 2 evict a half-open one first, then a closing one, then the oldest
+       (ft_evict_insert_at). */
+    uint8_t batch, ins_fallback;
+#if E4_STATS
+    uint64_t e4_evict[16]; /* evictions per service (E4_STATS builds only) */
+#endif
 };
 
 /* pf_pkt (Atieh): the 54 bytes of Ethernet + IPv4 + TCP headers from off, which may span two cache lines */
@@ -202,6 +217,8 @@ static lb_t *init(gen_t *g, const gen_config_t *cfg)
     lb->pf_bucket = (uint8_t)param_ul(g, "pf_bucket", 0, 0, 2);
     lb->pf_entry = (uint8_t)param_ul(g, "pf_entry", 0, 0, 2);
     lb->pf_dist = (uint32_t)param_ul(g, "pf_dist", 0, 0, 64);
+    lb->batch = (uint8_t)param_ul(g, "batch", 64, 1, 64);
+    lb->ins_fallback = (uint8_t)param_ul(g, "ins_fallback", 0, 0, 2);
     return lb;
 }
 
@@ -400,6 +417,14 @@ static uint64_t insert(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, uint64_t 
         if (ft_insert_at(lb->ft, &s[i].key, id, st, &s[i].loc,
                     svc, now))
             stored |= 1ull << i;
+        else if (lb->ins_fallback &&
+                 ft_evict_insert_at(lb->ft, &s[i].key, id, st, &s[i].loc, svc, now, lb->ins_fallback)) {
+            stored |= 1ull << i;
+#if E4_STATS
+            if (svc < 16)
+                lb->e4_evict[svc]++;
+#endif
+        }
     }
     return stored;
 }
@@ -536,6 +561,72 @@ static void e3_report(e3_t *e, const lb_t *lb)
 }
 #endif
 
+#if E4_STATS
+/* Per service and per second of trace time: valid packets, misses (replica computed), new flows (SYN among the
+   misses), failed inserts (after the fallback), evictions; and, at the end of each second, the service's entries by
+   state, and how many of them have expired (their flow is over: still in the table until an insert reuses the slot). */
+typedef struct {
+    uint64_t rx[16], miss[16], syn[16], fail[16], evict_seen[16];
+    uint64_t sec_end;
+} e4_t;
+
+static void e4_close_second(e4_t *e, lb_t *lb, uint64_t now)
+{
+    uint32_t half[16] = {0}, est[16] = {0}, fin[16] = {0}, expired[16] = {0};
+    const flow_table_t *ft = lb->ft;
+    for (uint32_t i = 0; i < ft->capacity; i++) {
+        uint32_t sl = ft->slots[i];
+        if (!sl)
+            continue;
+        const flow_entry_t *en = &ft->entries[(sl >> ft->sig_bits) - 1];
+        uint32_t sv = en->service_id < 16 ? en->service_id : 15;
+        const svc_timeouts_t *to = &lb->to[en->service_id];
+        uint64_t limit = en->state == FS_HALF_OPEN ? to->half : en->state == FS_CLOSING ? to->fin : to->est;
+        if (now >= en->last_seen && now - en->last_seen >= limit)
+            expired[sv]++;                          /* as is_expired (src/flow_table.c) decides */
+        else if (en->state == FS_HALF_OPEN)
+            half[sv]++;
+        else if (en->state == FS_CLOSING)
+            fin[sv]++;
+        else
+            est[sv]++;
+    }
+    for (uint32_t sv = 0; sv < lb->cfg.n_services && sv < 16; sv++) {
+        uint64_t ev = lb->e4_evict[sv] - e->evict_seen[sv];
+        e->evict_seen[sv] = lb->e4_evict[sv];
+        fprintf(stderr, "E4T t=%llu svc=%u half_open=%u established=%u closing=%u expired=%u rx=%llu miss=%llu "
+                "syn=%llu ins_fail=%llu evict=%llu\n", (unsigned long long)(e->sec_end / 1000000000ull), sv,
+                half[sv], est[sv], fin[sv], expired[sv], (unsigned long long)e->rx[sv],
+                (unsigned long long)e->miss[sv], (unsigned long long)e->syn[sv], (unsigned long long)e->fail[sv],
+                (unsigned long long)ev);
+        e->rx[sv] = e->miss[sv] = e->syn[sv] = e->fail[sv] = 0;
+    }
+}
+
+static void e4_count(e4_t *e, lb_t *lb, pkt_t **p, uint8_t n, const pkt_state_t *s, uint64_t computed,
+                     uint64_t got, uint64_t stored)
+{
+    for (uint8_t i = 0; i < n; i++) {
+        if (!s[i].valid)
+            continue;
+        while (p[i]->ts_ns >= e->sec_end) {
+            e4_close_second(e, lb, e->sec_end);
+            e->sec_end += 1000000000ull;
+        }
+        uint32_t sv = s[i].service_id < 16 ? s[i].service_id : 15;
+        uint64_t bit = 1ull << i;
+        e->rx[sv]++;
+        if (computed & bit) {
+            e->miss[sv]++;
+            if (s[i].key.protocol == 6 && is_syn(s[i].tcp_flags))
+                e->syn[sv]++;
+        }
+        if ((got & bit) && !(stored & bit))
+            e->fail[sv]++;
+    }
+}
+#endif
+
 int main(int argc, char **argv)
 {
     if (argc < 2) {
@@ -551,13 +642,17 @@ int main(int argc, char **argv)
     static e3_t e3;
     e3.sec_end = 1000000000ull;
 #endif
+#if E4_STATS
+    static e4_t e4;
+    e4.sec_end = 1000000000ull;
+#endif
     while (gen_running(g)) {
         /* Tunnelled replies (bonus, web_tunnel=1) are not handled: drop whatever reaches the internal NIC. */
         uint8_t m = gen_rx_batch(g, GEN_NIC_INT, p, 64);
         if (m)
             gen_drop(g, p, m, ~0ull);
 
-        uint8_t n = gen_rx_batch(g, GEN_NIC_EXT, p, 64);
+        uint8_t n = gen_rx_batch(g, GEN_NIC_EXT, p, lb->batch);
         if (n == 0)
             continue;
         uint64_t all = n == 64 ? ~0ull : (1ull << n) - 1;
@@ -570,7 +665,12 @@ int main(int argc, char **argv)
         }
         uint64_t hit = gen_lookup(g, lb, p, n, s, ok);
         uint64_t got = gen_replica(g, lb, p, n, s, ok & ~hit);
+#if E4_STATS
+        uint64_t stored = gen_insert(g, lb, p, n, s, got);      /* sent even if the insert fails */
+        e4_count(&e4, lb, p, n, s, ok & ~hit, got, stored);
+#else
         gen_insert(g, lb, p, n, s, got);                        /* sent even if the insert fails */
+#endif
         uint64_t send = hit | got;
 #if E3_STATS
         for (uint8_t i = 0; i < n; i++) {

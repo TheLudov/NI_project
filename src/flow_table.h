@@ -136,6 +136,12 @@ int ft_insert(flow_table_t *ft, const flow_key_t *key, uint32_t replica, uint8_t
 int ft_insert_at(flow_table_t *ft, const flow_key_t *key, uint32_t replica, uint8_t state, const ft_loc_t *loc,
                  uint32_t service_id, uint64_t current_time);
 
+/* E4 (Atieh): the fallback after a failed ft_insert_at (lb/main.c, ins_fallback): an entry of the key's two buckets
+   gives its slot to the key. policy 1: the entry seen longest ago; policy 2: a half-open entry first, then a closing
+   one, then the entry seen longest ago. Return: 1 if stored (0 only if both buckets are empty, which a failed insert
+   rules out). */
+int ft_evict_insert_at(flow_table_t *ft, const flow_key_t *key, uint32_t replica, uint8_t state,
+                       const ft_loc_t *loc, uint32_t service_id, uint64_t current_time, int policy);
 /* Prefetching (E1, by Atieh). These two only ask the CPU to start loading cache lines (__builtin_prefetch) and
    return at once, without waiting for them; they change nothing in the table. The LB's stages call them on a whole
    batch before they look the batch up (lb/main.c: pf_bucket, pf_entry), so that the cache misses of the batch's
