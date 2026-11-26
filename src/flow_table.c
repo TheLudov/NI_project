@@ -146,7 +146,6 @@ static inline void write_entry(flow_entry_t *e, const flow_key_t *key, uint32_t 
     e->state = state;
     e->last_seen = current_time;
     e->service_id = service_id;
-    e->CLOSED_timeout = (state == FS_CLOSING) ? current_time : 0;
 }
 
 flow_entry_t *ft_find(flow_table_t *ft, const flow_key_t *key, uint64_t hash, uint64_t current_time){
@@ -312,8 +311,7 @@ static int is_expired(const flow_table_t *ft,
             break;
 
         case FS_CLOSING:
-            timeout = to->fin;
-            reference_time = entry->CLOSED_timeout;
+            timeout = to->fin;   /* from the FIN or RST: last_seen is not refreshed once closing */
             break;
 
         default:

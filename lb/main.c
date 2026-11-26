@@ -257,22 +257,26 @@ static uint64_t lookup(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, uint64_t 
 
         /* Lifecycle (brief, item 5): refresh the last-seen time; FIN or RST starts the closing grace period,
            which later packets do not extend. */
+        /* last_seen is refreshed by every packet except those of a closing flow: there it stays the time of the
+           FIN or RST, which starts the grace period (is_expired, src/flow_table.c) */
         if (s[i].key.protocol == 6 && (f & (TCP_FIN | TCP_RST))) {
             if (e->state != FS_CLOSING) {
                 e->state = FS_CLOSING;
-                e->CLOSED_timeout = now;
+                if (now > e->last_seen)
+                    e->last_seen = now;
             }
         } else if (syn) {
             e->state = FS_HALF_OPEN;
+            if (now > e->last_seen)
+                e->last_seen = now;
         } else if (e->state != FS_CLOSING) {
             if (e->state == FS_HALF_OPEN &&
                 (s[i].key.protocol != 6 || (f & TCP_ACK))) {
                 e->state = FS_ESTABLISHED;
             }
+            if (now > e->last_seen)
+                e->last_seen = now;
         }
-
-        if (now > e->last_seen)
-            e->last_seen = now;
         hit |= 1ull << i;
     }
     return hit;

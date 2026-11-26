@@ -44,12 +44,12 @@ typedef struct {
 //An entry is in use iff exactly one slot of the index refers to it; a free entry is on the free list, its replica
 //field then holding the index of the next free entry. Entries never move once stored.
 typedef struct {
-    uint64_t last_seen; // last time the flow was seen (trace time, ns)
+    uint64_t last_seen; // last time the flow was seen (trace time, ns); for a closing flow, the time its FIN or RST
+                        // came: later packets do not move it, so they do not extend the grace period
     flow_key_t key; //id of the connexion
     uint32_t replica;//choosen server for the flow: its replica id in the service's ring (ring_replica_id)
     uint8_t state; //state of the flow: half-open, established, closing (lb/main.c)
-    uint8_t service_id; //id of the service the flow belongs to (lb/main.c)
-    uint64_t CLOSED_timeout; //time when the flow will be closed (lb/main.c)
+    uint8_t service_id; //id of the service the flow belongs to (lb/main.c); fits in the padding: 32 bytes in all
 }flow_entry_t;
 
 //struct to represent the flow table: a cuckoo index (slots) and an entry array (entries)
