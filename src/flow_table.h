@@ -106,6 +106,16 @@ Return: pointer to the live entry of the flow, or NULL if the flow is not in the
 */
 flow_entry_t *ft_find(flow_table_t *ft, const flow_key_t *key, uint64_t hash, uint64_t current_time);
 
+/* Where a key can be in the index: its two buckets and its signature, as ft_find and ft_insert compute them from the
+   hash (Atieh). ft_locate computes it once (the bucket indices cost three divisions); ft_find_at, ft_insert_at and
+   the prefetches below reuse it. ft_find and ft_insert are ft_locate followed by these. */
+typedef struct {
+    uint32_t bucket[2];
+    uint32_t sig;
+} ft_loc_t;
+void ft_locate(const flow_table_t *ft, uint64_t hash, ft_loc_t *loc);
+flow_entry_t *ft_find_at(flow_table_t *ft, const flow_key_t *key, const ft_loc_t *loc, uint64_t current_time);
+
 
 /*Function to insert or update a flow entry (upsert)
 Param:
@@ -123,6 +133,23 @@ Return: 1 if the entry is stored, 0 otherwise
 */
 int ft_insert(flow_table_t *ft, const flow_key_t *key, uint32_t replica, uint8_t state, uint64_t hash,
               uint32_t service_id, uint64_t current_time);
+int ft_insert_at(flow_table_t *ft, const flow_key_t *key, uint32_t replica, uint8_t state, const ft_loc_t *loc,
+                 uint32_t service_id, uint64_t current_time);
+
+/* Prefetching (E1, by Atieh). These two only ask the CPU to start loading cache lines (__builtin_prefetch) and
+   return at once, without waiting for them; they change nothing in the table. The LB's stages call them on a whole
+   batch before they look the batch up (lb/main.c: pf_bucket, pf_entry), so that the cache misses of the batch's
+   packets overlap instead of being paid one after the other. */
+
+/* Starts loading the key's first bucket of the index, and its second one too if both (every cache line they span).
+   A lookup that finds the key in its first bucket never reads the second, and most stored keys are in their first
+   bucket (an insert tries it first): asking for the second costs a cache line, and a page walk, most hits never use. */
+void ft_prefetch_buckets(const flow_table_t *ft, const ft_loc_t *loc, int both);
+
+/* Starts loading the entries that the key's first bucket (both buckets if both) points to with the key's signature:
+   normally only the key's own entry, if it is stored there. It reads the bucket(s), so it pays off once
+   ft_prefetch_buckets has brought them in. */
+void ft_prefetch_entries(const flow_table_t *ft, const ft_loc_t *loc, int both);
 
 
 #endif // FLOW_TABLE_H
