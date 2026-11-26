@@ -148,14 +148,23 @@ static lb_t *init(gen_t *g, const gen_config_t *cfg)
     memset(lb, 0, sizeof *lb);
     lb->cfg = *cfg;
 
-    /* Replica selection (Atieh): one ring per service, ring_v points per replica (default 100). */
+    /* Replica selection (Atieh): one ring per service, ring_v points per replica (default 100), or, for one
+       service, ring_v_<its VIP> (e.g. ring_v_198.51.100.10=1000). E3 picks v per service: more points balance
+       better but make the ring bigger and each lookup and replica event slower, and the services differ in how
+       much they gain and how often they look the ring up (web: every new flow and every SYN of a flood). */
     uint32_t v = (uint32_t)param_ul(g, "ring_v", 100, 1, 100000);
     lb->rings = gen_alloc(g, (cfg->n_services ? cfg->n_services : 1) * sizeof *lb->rings, 0, 0);
     if (!lb->rings)
         init_fail("gen_alloc for rings failed");
-    for (uint32_t k = 0; k < cfg->n_services; k++)
-        if (!ring_init(&lb->rings[k], g, &cfg->services[k], v, cfg->seed))
+    for (uint32_t k = 0; k < cfg->n_services; k++) {
+        uint32_t vip = cfg->services[k].vip;
+        char key[48];
+        snprintf(key, sizeof key, "ring_v_%u.%u.%u.%u", vip >> 24, (vip >> 16) & 0xff, (vip >> 8) & 0xff,
+                 vip & 0xff);
+        uint32_t vk = (uint32_t)param_ul(g, key, v, 1, 100000);
+        if (!ring_init(&lb->rings[k], g, &cfg->services[k], vk, cfg->seed))
             init_fail("gen_alloc for a service's ring failed (ring_v too large for the memory budget?)");
+    }
 
     const char *hf = gen_param(g, "hashfn");
     if (!hf || strcmp(hf, "tab") == 0) {
@@ -451,6 +460,82 @@ static const lb_ops_t ops = {
     .replica_of = replica_of,
 };
 
+/* ---- E3 (Atieh): flows and packets per replica, for the balance measurements of scripts/e3/run_e3.sh ----
+   Off unless the LB is compiled with -DE3_STATS=1 (run_e3.sh builds that copy as build/lb_e3); the normal build has
+   none of it. Counted on the main LB's loop only, just before each batch is sent: a packet sent counts for its
+   replica, a packet that needed compute_replica (a flow-table miss: in a run without churn, a new flow) counts one
+   flow for it. Every second of trace time, the most loaded replica's packets over the average gives the imbalance
+   of that second, the load a replica actually sees at a given moment. */
+#ifndef E3_STATS
+#define E3_STATS 0
+#endif
+#if E3_STATS
+#define E3_SVC 16
+#define E3_REP 512
+#define E3_SEC 4096
+typedef struct {
+    uint64_t flows[E3_SVC][E3_REP], pkts[E3_SVC][E3_REP], sec[E3_SVC][E3_REP];
+    float ratio[E3_SVC][E3_SEC];   /* per second: most loaded active replica's packets / average */
+    uint32_t n_sec[E3_SVC];
+    uint64_t sec_end;              /* end of the current second of trace time */
+} e3_t;
+
+static void e3_close_second(e3_t *e, const lb_t *lb)
+{
+    for (uint32_t sv = 0; sv < lb->cfg.n_services && sv < E3_SVC; sv++) {
+        const ring_t *r = &lb->rings[sv];
+        uint64_t sum = 0, mx = 0;
+        uint32_t act = 0;
+        for (uint32_t id = 0; id < r->n_reps && id < E3_REP; id++) {
+            if (ring_state(r, id) == REPLICA_STATE_ACTIVE) {
+                act++;
+                sum += e->sec[sv][id];
+                if (e->sec[sv][id] > mx)
+                    mx = e->sec[sv][id];
+            }
+            e->sec[sv][id] = 0;
+        }
+        if (act && sum && e->n_sec[sv] < E3_SEC)
+            e->ratio[sv][e->n_sec[sv]++] = (float)((double)mx * act / (double)sum);
+    }
+}
+
+static int e3_cmp_float(const void *a, const void *b)
+{
+    float x = *(const float *)a, y = *(const float *)b;
+    return x < y ? -1 : x > y;
+}
+
+static void e3_report(e3_t *e, const lb_t *lb)
+{
+    for (uint32_t sv = 0; sv < lb->cfg.n_services && sv < E3_SVC; sv++) {
+        const ring_t *r = &lb->rings[sv];
+        uint64_t fs = 0, fm = 0, ps = 0, pm = 0;
+        uint32_t act = 0;
+        for (uint32_t id = 0; id < r->n_reps && id < E3_REP; id++) {
+            if (ring_state(r, id) != REPLICA_STATE_ACTIVE)
+                continue;
+            act++;
+            fs += e->flows[sv][id];
+            ps += e->pkts[sv][id];
+            if (e->flows[sv][id] > fm) fm = e->flows[sv][id];
+            if (e->pkts[sv][id] > pm) pm = e->pkts[sv][id];
+            uint32_t ip = ring_ip(r, id);
+            fprintf(stderr, "E3R svc=%u ip=%u.%u.%u.%u flows=%llu pkts=%llu\n", sv, ip >> 24, ip >> 16 & 255,
+                    ip >> 8 & 255, ip & 255, (unsigned long long)e->flows[sv][id], (unsigned long long)e->pkts[sv][id]);
+        }
+        uint32_t ns = e->n_sec[sv];
+        qsort(e->ratio[sv], ns, sizeof(float), e3_cmp_float);
+        fprintf(stderr, "E3 svc=%u v=%u secret_seed=%016llx active=%u flows=%llu pkts=%llu flows_maxavg=%.4f "
+                "pkts_maxavg=%.4f sec=%u sec_median=%.4f sec_p95=%.4f\n", sv, r->v, (unsigned long long)lb->cfg.seed,
+                act, (unsigned long long)fs,
+                (unsigned long long)ps, fs && act ? (double)fm * act / (double)fs : 0,
+                ps && act ? (double)pm * act / (double)ps : 0, ns, ns ? e->ratio[sv][ns / 2] : 0,
+                ns ? e->ratio[sv][(ns * 95) / 100] : 0);
+    }
+}
+#endif
+
 int main(int argc, char **argv)
 {
     if (argc < 2) {
@@ -462,6 +547,10 @@ int main(int argc, char **argv)
     lb_t *lb =gen_lb(g);
     pkt_t *p[64];
     pkt_state_t s[64];
+#if E3_STATS
+    static e3_t e3;
+    e3.sec_end = 1000000000ull;
+#endif
     while (gen_running(g)) {
         /* Tunnelled replies (bonus, web_tunnel=1) are not handled: drop whatever reaches the internal NIC. */
         uint8_t m = gen_rx_batch(g, GEN_NIC_INT, p, 64);
@@ -483,6 +572,23 @@ int main(int argc, char **argv)
         uint64_t got = gen_replica(g, lb, p, n, s, ok & ~hit);
         gen_insert(g, lb, p, n, s, got);                        /* sent even if the insert fails */
         uint64_t send = hit | got;
+#if E3_STATS
+        for (uint8_t i = 0; i < n; i++) {
+            if (!(send & (1ull << i)))
+                continue;
+            while (p[i]->ts_ns >= e3.sec_end) {
+                e3_close_second(&e3, lb);
+                e3.sec_end += 1000000000ull;
+            }
+            uint32_t sv = s[i].service_id, id = ring_replica_id(&lb->rings[sv], s[i].replica);
+            if (sv < E3_SVC && id < E3_REP) {
+                e3.pkts[sv][id]++;
+                e3.sec[sv][id]++;
+                if (got & (1ull << i))
+                    e3.flows[sv][id]++;
+            }
+        }
+#endif
         for (uint8_t i = 0; i < n; i++)
             if (send & (1ull << i))
                 encap(lb, p[i], s[i].replica);
@@ -502,6 +608,9 @@ int main(int argc, char **argv)
             ft->sig_bits, ft->num_buckets, ft->bucket_size, ft->capacity, (unsigned long long)used,
             (unsigned long long)st->lookups, (unsigned long long)st->hits, (unsigned long long)st->slots_checked,
             (unsigned long long)st->sig_matches, (unsigned long long)st->false_matches);
+#endif
+#if E3_STATS
+    e3_report(&e3, lb);
 #endif
     gen_close(g);
     return 0;

@@ -1,0 +1,9 @@
+# e3_chat.scn (E3, Atieh): chat alone, as in scenarios/chat.scn but with no replica churn (no upgrade, no failures,
+# no scale-out) and no LB churn, so that the set of replicas is fixed and the balance can be read. 4 minutes.
+duration 4min
+warmup 66
+
+service chat
+  vip 198.51.100.10 port 443 proto tcp
+  replicas 64 10.1.0.1
+  model chat flows=500k lifetime=1h keepalive=60 event_interval=2min reconnect=10

@@ -1,0 +1,9 @@
+# e3_video.scn (E3, Atieh): video alone, as in scenarios/video.scn but with no replica churn (no upgrade, no failures,
+# no scale-out) and no LB churn, so that the set of replicas is fixed and the balance can be read. 4 minutes.
+duration 4min
+warmup 66
+
+service video
+  vip 198.51.100.20 port 443 proto tcp
+  replicas 32 10.2.0.1
+  model video flows=2500 lifetime_median=8min segment=4 on_share=0.25 pps=200
