@@ -13,6 +13,14 @@
  *
  * Put your components (the stages, your tables) in src/: build/autotune links
  * them too.  README.md documents the harness.
+ *
+ * Who is responsible for what (each function below also names its owner):
+ *   Ludovic: parameters and timeouts (param_ul, init_timeouts), the lookup and insert stages, encapsulation
+ *            (ip_checksum, put32, encap), the main loop, the SYN-flood defence and occupancy probe (E5).
+ *   Samuel:  the flow-table calls in init, hash, lookup and insert, and the parser's use in hash.
+ *   Atieh:   replica selection (rings in init, on_event, compute_replica, the down-replica and SYN rules in
+ *            lookup), prefetching (pf_*), ft_loc reuse, batch, ins_fallback and ev_coalesce (E4), and the
+ *            E3/E4 statistics (e3_*, e4_*).
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -110,6 +118,7 @@ struct pkt_state {
 
 /* State of a flow inserted on this packet: a SYN opens it, a FIN or RST closes it, anything else is a flow
    already in progress (from another LB, or evicted earlier). UDP has no handshake: established. */
+/* Responsible: Ludovic */
 static uint8_t first_state(const pkt_state_t *s)
 {
     if (s->key.protocol != 6)
@@ -124,6 +133,7 @@ static uint8_t first_state(const pkt_state_t *s)
 
 /* The harness does not check init's result: it goes on to call the copy's hash with a NULL lb and crashes
    (segfault in hash). So a setup error must end the run here, with a message, rather than return NULL. */
+/* Responsible: Atieh */
 static void init_fail(const char *msg)
 {
     fprintf(stderr, "init: %s\n", msg);
@@ -131,6 +141,7 @@ static void init_fail(const char *msg)
 }
 
 /* A whole-number parameter in [min, max], def if absent; a bad value ends the run (rejects "", "abc", "100x"). */
+/* Responsible: Ludovic */
 static unsigned long param_ul(gen_t *g, const char *key, unsigned long def, unsigned long min, unsigned long max)
 {
     const char *v = gen_param(g, key);
@@ -150,6 +161,7 @@ static unsigned long param_ul(gen_t *g, const char *key, unsigned long def, unsi
 
 /* Timeouts, in ms: to_half_ms, to_est_ms, to_fin_ms for every service, then optional overrides per service,
    keyed by its VIP */
+/* Responsible: Ludovic */
 static void init_timeouts(gen_t *g, lb_t *lb)
 {
     static const char *const names[3] = { "to_half_ms", "to_est_ms", "to_fin_ms" };
@@ -177,7 +189,7 @@ static void init_timeouts(gen_t *g, lb_t *lb)
     }
 }
 
-//modify by Sam
+/* Responsible: Ludovic (parameters, setup), Samuel (flow table), Atieh (rings, prefetch and E4 parameters) */
 static lb_t *init(gen_t *g, const gen_config_t *cfg)
 {
     lb_t *lb = gen_alloc(g, sizeof(lb_t), 0, 0);
@@ -277,7 +289,7 @@ static lb_t *init(gen_t *g, const gen_config_t *cfg)
     return lb;
 }
 
-/* Made by Atieh: replica events update the service's ring (incrementally, see src/ring.c). */
+/* Responsible: Atieh. Replica events update the service's ring (incrementally, see src/ring.c). */
 static void on_event(lb_t *lb, const gen_event_t *ev)
 {
     if (ev->service >= lb->cfg.n_services)
@@ -290,7 +302,7 @@ static void on_event(lb_t *lb, const gen_event_t *ev)
                 ev->service, (int)ev->type);
 }
 
-/*Made By ludovic and next modify by samuel*/
+/* Responsible: Ludovic, then Samuel (parser, hash); Atieh (ft_locate once per packet, ev_coalesce, prefetching) */
 
 static void hash(lb_t *lb, pkt_t **p, uint8_t n,
                  pkt_state_t *s, uint64_t mask)
@@ -364,7 +376,7 @@ static void hash(lb_t *lb, pkt_t **p, uint8_t n,
  *     miss too. A retransmitted SYN is a new-flow decision: without this, a SYN whose replica failed
  *     silently and was then drained is sent to a draining replica (44 misplaced flows on events.scn).
  *   With neither check, tests/failover.scn and tests/churn.scn fail (52 and 83 misplaced flows). */
- //modify by sam 
+/* Responsible: Ludovic (stage), Samuel (flow-table calls), Atieh (ft_loc, prefetching, down-replica and SYN rules) */
 static uint64_t lookup(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, uint64_t mask)
 {
     /* Prefetching (Atieh). pf_dist=0: pf_entry reads every packet's buckets first (in cache already with pf_bucket,
@@ -439,7 +451,7 @@ static uint64_t lookup(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, uint64_t 
     return hit;
 }
 
-/* Made by Atieh: consistent hashing over the service's active replicas.
+/* Responsible: Atieh. Consistent hashing over the service's active replicas.
    Works on its own (the harness's copy calls it right after hash, without lookup). */
 static uint64_t compute_replica(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, uint64_t mask)
 {
@@ -461,7 +473,7 @@ static uint64_t compute_replica(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, 
    evicted earlier), and flows whose stored replica lookup rejected. ft_insert is an upsert, so two packets of one
    new flow in the same batch (same hash, same ring: same replica) store a single entry. A failed insert only
    clears the packet's bit: the main loop forwards it anyway, by consistent hashing (brief, item 5). */
-//modify by sam
+/* Responsible: Ludovic (stage), Samuel (flow-table calls), Atieh (ins_fallback, E4) */
 static uint64_t insert(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, uint64_t mask)
 {
     uint64_t stored = 0;
@@ -490,6 +502,7 @@ static uint64_t insert(lb_t *lb, pkt_t **p, uint8_t n, pkt_state_t *s, uint64_t 
     return stored;
 }
 
+/* Responsible: Ludovic */
 static uint32_t replica_of(const pkt_state_t *s)
 {
     return s->replica;
@@ -497,7 +510,7 @@ static uint32_t replica_of(const pkt_state_t *s)
 
 /* IP-in-IP encapsulation, ported from Atieh's test rig (scripts/tests_ring/e2e_main.c):
    the new Ethernet and outer IPv4 headers go over the 20 bytes of headroom and the old Ethernet header; the inner
-   packet does not move. */
+   packet does not move. Responsible: Ludovic (from Atieh's test rig) */
 static uint16_t ip_checksum(const uint8_t *h)
 {
     uint32_t sum = 0;
@@ -566,6 +579,7 @@ typedef struct {
     uint64_t sec_end;              /* end of the current second of trace time */
 } e3_t;
 
+/* Responsible: Atieh (E3 statistics, this function and the two below) */
 static void e3_close_second(e3_t *e, const lb_t *lb)
 {
     for (uint32_t sv = 0; sv < lb->cfg.n_services && sv < E3_SVC; sv++) {
@@ -631,6 +645,7 @@ typedef struct {
     uint64_t sec_end;
 } e4_t;
 
+/* Responsible: Atieh (E4 statistics, this function and the one below) */
 static void e4_close_second(e4_t *e, lb_t *lb, uint64_t now)
 {
     uint32_t half[16] = {0}, est[16] = {0}, fin[16] = {0}, expired[16] = {0};
@@ -688,6 +703,7 @@ static void e4_count(e4_t *e, lb_t *lb, pkt_t **p, uint8_t n, const pkt_state_t 
 }
 #endif
 
+/* Responsible: Ludovic (loop), Samuel (flow table), Atieh (batch, E3/E4 hooks) */
 int main(int argc, char **argv)
 {
     if (argc < 2) {

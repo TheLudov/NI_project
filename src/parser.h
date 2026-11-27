@@ -1,6 +1,5 @@
-//
-// Created by Ludovic on 20/11/26.
-//
+/* Packet parser: the 5-tuple of an Ethernet/IPv4 TCP or UDP frame.
+ * Responsible: Samuel (parse_flow, rd16, rd32), Ludovic (first version). */
 
 #ifndef NI_PROJECT_PARSER_H
 #define NI_PROJECT_PARSER_H

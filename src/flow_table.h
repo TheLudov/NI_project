@@ -1,4 +1,15 @@
-/*Create and done By Samuel*/
+/* Cuckoo flow table.
+ * Responsible: Samuel (the table, insert, displacement search, expiry) and Ludovic (slots, entries, ft_init,
+ * ft_find_at, ft_occupancy).
+ *
+ * Atieh El Gebrin's work in this table (flow_table.h and flow_table.c):
+ *   - ft_loc_t and ft_locate: a key's two buckets and signature, computed once per packet in the LB's hash stage,
+ *     then reused by ft_find_at, ft_insert_at and the prefetches (ft_find and ft_insert are ft_locate + these).
+ *   - Faster bucket indices: multiply-shift (reduce, get_bucket_indices) instead of three divisions (~9 ns -> ~2 ns
+ *     a key on our VM), and the automatic signature width (sig_bits=0).
+ *   - Prefetching (E1): ft_prefetch_buckets and ft_prefetch_entries (pf_bucket=2: -13 % time per packet).
+ *   - Insert fallback (E4): ft_evict_insert_at, policies 1-3 (ins_fallback).
+ */
 #ifndef FLOW_TABLE_H
 #define FLOW_TABLE_H
 

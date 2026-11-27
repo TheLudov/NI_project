@@ -1,5 +1,7 @@
 # Tests for the replica-selection part (ring)
 
+Responsible: Atieh.
+
 Not part of the submission; keep them in scripts/ or outside the archive.
 
 - `test_ring.c` — unit tests, linked without libgen (a fake gen_alloc that can be told to fail):

@@ -1,4 +1,5 @@
 /* tabhash.h: simple tabulation hashing of a flow's 5-tuple (brief, item 3 and E2).
+ * Responsible: Ludovic (tables, seed), Samuel (compute_hash)
  *
  * The key is the 13 bytes of the 5-tuple (src_ip 4, dst_ip 4, src_port 2, dst_port 2, protocol 1). Each key byte
  * has its own table of 256 random 64-bit values, filled from the secret seed at init; the hash is the XOR of the

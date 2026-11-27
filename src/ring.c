@@ -1,6 +1,6 @@
 /* ring.c: replica selection, a consistent-hash ring with virtual nodes (one ring per service).
  *
- * Author: Atieh El Gebrin
+ * Responsible: Atieh El Gebrin
  */
 #include "ring.h"
 

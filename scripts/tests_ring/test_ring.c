@@ -1,4 +1,5 @@
-/* Unit tests for src/ring.c / src/ring.h, linked WITHOUT libgen.a:
+/* Responsible: Atieh El Gebrin.
+   Unit tests for src/ring.c / src/ring.h, linked WITHOUT libgen.a:
    gen_alloc/gen_mfree are replaced by a malloc-based fake that can be told to fail. */
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>

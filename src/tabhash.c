@@ -1,6 +1,6 @@
 /* tabhash.c: filling the tables of simple tabulation hashing (see tabhash.h).
  *
- * Author: Ludovic and samuel for compute_hash() function
+ * Responsible: Ludovic; Samuel for compute_hash()
  */
 #include "tabhash.h"
 

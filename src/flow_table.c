@@ -1,4 +1,8 @@
-/*Create and done By Samuel*/
+/* Cuckoo flow table.
+ * Responsible: Samuel (the table, insert, displacement search, expiry) and Ludovic (slots, entries, ft_init,
+ * ft_find_at, ft_occupancy). Atieh: ft_locate / ft_find / ft_insert with ft_loc_t, the multiply-shift bucket
+ * indices (reduce, get_bucket_indices), prefetching (ft_prefetch_*) and the insert fallback (ft_evict_insert_at, E4).
+ */
 #include "flow_table.h"
 
 #include <stddef.h>

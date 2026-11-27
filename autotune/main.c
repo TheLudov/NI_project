@@ -1,5 +1,5 @@
 /* autotune/main.c: chooses the bucket layout of the flow table.
- * Author: Atieh El Gebrin
+ * Responsible: Atieh (the layout search and its timing), Samuel (first version)
  */
 #define _POSIX_C_SOURCE 200809L
 #include <stdint.h>

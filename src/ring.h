@@ -1,6 +1,6 @@
 /* ring.h: replica selection, a consistent-hash ring with virtual nodes (one ring per service).
  *
- * Author: Atieh El Gebrin
+ * Responsible: Atieh El Gebrin
  *
  * Each ACTIVE replica owns v points on a 32-bit ring. A flow goes to the replica owning the first point
  * at or after the flow's hash (wrapping around). Draining and down replicas have no points, so they get no
