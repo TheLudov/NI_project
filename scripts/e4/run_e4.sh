@@ -17,7 +17,7 @@
 #               saturation and events
 #               results, and a machine where the harness keeps the pace (pace_valid = 1): not a small VM.
 #
-#   scripts/e4/run_e4.sh [GROUPS] [SEEDS]   GROUPS: comma-separated (default functional,saturation,events); SEEDS: 5
+#   scripts/e4/run_e4.sh [RUN_GROUPS] [SEEDS]   RUN_GROUPS: comma-separated (default functional,saturation,events); SEEDS: 5
 #   LB_CPU, GEN_CPU: the cores the loop and the generator are pinned to in saturation and paced mode (default 0, 1).
 #   A run whose results exist (build/e4/raw/TAG.csv) is skipped: an interrupted run resumes where it stopped.
 #   About 35 min for the default groups on our 2-vCPU VM; paced about 40 min more.
@@ -51,9 +51,9 @@ if [ "${1:-}" = __one ]; then           # a functional job, from xargs below
     exit 0
 fi
 
-GROUPS=${1:-functional,saturation,events}
+RUN_GROUPS=${1:-functional,saturation,events}
 SEEDS=${2:-5}
-has() { case ",$GROUPS," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
+has() { case ",$RUN_GROUPS," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
 # pset LIST KEY VALUE: the comma-separated LIST with KEY set to VALUE (gen_open rejects a key given twice)
 pset() { printf '%s\n' "$1" | tr ',' '\n' | grep -v "^$2=" | grep -v '^$' | { cat; echo "$2=$3"; } | paste -sd, -; }
 
@@ -68,7 +68,7 @@ cc -std=c11 -O2 -Wall -Wextra $AF -Isrc -Igen -DE4_STATS=1 src/*.c lb/main.c "$L
 {   # the machine, for the report (the brief asks for it next to every figure)
     uname -srm
     if command -v lscpu > /dev/null; then
-        lscpu | grep -E '^(Model name|CPU\(s\)|Thread\(s\) per core|Hypervisor vendor|Virtualization type|L1d|L2|L3)' || true
+        LC_ALL=C lscpu | grep -E '^(Model name|CPU\(s\)|Thread\(s\) per core|Hypervisor vendor|Virtualization type|L1d|L2|L3)' || true
     fi
     grep -E '^MemTotal' /proc/meminfo 2> /dev/null || true
     cc --version | head -n 1
@@ -108,10 +108,13 @@ if has functional; then
         for t in 2000 5000; do echo "f_to__video__est${t}__s${seed} video $(pset "$Q" to_est_ms $t)"; done
         echo "f_to__web__est5000__s$seed web $(pset "$Q" to_est_ms_198.51.100.30 5000)"
         echo "f_to__web__fin500__s$seed web $(pset "$Q" to_fin_ms 500)"
+        # web's own setting (ins_fallback_198.51.100.30 in config.params) overrides ins_fallback: set both
         for fb in 0 1 2; do
             echo "f_fb__chat__b40000f${fb}__s${seed} chat $(pset "$(pset "$Q" ft_buckets 40000)" ins_fallback $fb)"
-            echo "f_fb__web__b4096f${fb}__s${seed} web $(pset "$(pset "$Q" ft_buckets 4096)" ins_fallback $fb)"
             echo "f_fb__video__b256f${fb}__s${seed} video_5m $(pset "$(pset "$Q" ft_buckets 256)" ins_fallback $fb)"
+        done
+        for fb in 0 1 2 3; do
+            echo "f_fb__web__b4096f${fb}__s${seed} web $(pset "$(pset "$(pset "$Q" ft_buckets 4096)" ins_fallback $fb)" ins_fallback_198.51.100.30 $fb)"
         done
     done > "$OUT/functional.jobs"
     # how web flows end (fin, rst, vanish, ...), from the harness's per-flow log of 100 s of web.scn

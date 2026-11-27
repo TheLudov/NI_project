@@ -126,7 +126,11 @@ def tex_table(caption, label, header, rows, align):
 
 
 def texnum(s):
-    return s.replace("[", "{\\footnotesize[").replace("]", "]}") if "[" in s else s
+    """median, with [min, max] in small type on a second line"""
+    if "[" not in s:
+        return s
+    m, rest = s.split(" [", 1)
+    return f"\\begin{{tabular}}[t]{{@{{}}r@{{}}}}{m}\\\\[-3pt]{{\\scriptsize[{rest}}}\\end{{tabular}}"
 
 
 # ---- functional: the error table ----
@@ -154,11 +158,17 @@ for svc in SERVICES + ["events"]:
     w(f"  {svc + '.scn':12} " + "  ".join(f"{lab}={v}" for (lab, _, _), v in zip(OUTCOMES, vals)))
     trows.append([f"\\texttt{{{svc}.scn}}"] + [texnum(v) for v in vals])
 if trows:
+    head = ["Scenario", "Broken", "Lost", "Misplaced", "Malformed", "Misforwarded", "Leaks", "Drops",
+            "Failed inserts", "Memory (MB)"]
+    keep = {0, 1, 2, 3, len(head) - 1}            # always shown; the others only if not 0 in every run
+    zero = [i for i in range(len(head)) if i not in keep and all(r[i] == "0" for r in trows)]
+    cols = [i for i in range(len(head)) if i not in zero]
+    names = [head[i].lower() for i in zero]
+    note = (" " + (", ".join(names[:-1]) + " and " + names[-1] if len(names) > 1 else names[0]).capitalize()
+            + " were 0 in every run.") if names else ""
     tex_table("Outcomes of the error table, each service alone on its published scenario (functional mode, our "
-              "configuration; median [min, max] over 5 seeds). Misforwarded, malformed and leaks were 0 in every run.",
-              "tab:e4-outcomes",
-              ["Scenario", "Broken", "Lost", "Misplaced", "Malformed", "Misforw.", "Leaks", "Drops", "Failed ins.",
-               "Memory (MB)"], trows, "lrrrrrrrrr")
+              "configuration; median [min, max] over 5 seeds)." + note, "tab:e4-outcomes",
+              [head[i] for i in cols], [[r[i] for i in cols] for r in trows], "l" + "r" * (len(cols) - 1))
 w()
 
 # ---- chat churn ----
@@ -227,10 +237,11 @@ w()
 
 # ---- table size and insert fallback ----
 w("A table too small for the service, with each insert fallback (functional): 0 forward without an entry,")
-w("1 evict the oldest entry of the key's buckets, 2 evict a half-open one, then a closing one, then the oldest.")
+w("1 evict the oldest entry of the key's buckets, 2 evict a half-open one, then a closing one, then the oldest,")
+w("3 the oldest of the key's own service.")
 frows = []
 for svc, var, size in [("chat", "b40000", "320k slots"), ("web", "b4096", "32k slots"), ("video", "b256", "2k slots")]:
-    for fb in "012":
+    for fb in "0123":
         rs = runs.get(("f_fb", svc, f"{var}f{fb}"), [])
         if not rs:
             continue
@@ -247,7 +258,7 @@ if frows:
     tex_table("A table too small for the service, with each insert fallback (functional mode, median [min, max] over "
               "5 seeds; video on the first 5 minutes of its scenario). Fallback 0: forward without an entry; 1: evict "
               "the entry of the key's buckets seen longest ago; 2: a half-open entry first, then a closing one, then "
-              "the oldest.", "tab:e4-fallback",
+              "the oldest; 3 (web's, ours): 1 limited to the key's own service.", "tab:e4-fallback",
               ["Service", "Table", "Fallback", "Broken", "Failed inserts", "Evictions", "Replica comp."],
               frows[:-1], "llcrrrr")
 try:
@@ -280,6 +291,33 @@ for svc, var, size in [("video", "b1024", "8k slots"), ("web", "b8192", "65k slo
         t = col(rs, lambda r: num(r, "run", "raw_pps") / 1e6)
         mem = col(rs, lambda r: num(r, "run", "peak_memory") / 1e6)
         w(f"  {svc:6} batch 64, table of {size}: {fmt(t, 2)} Mpps, peak memory {fmt(mem, 1)} MB")
+all_sat = [r for (g, _, _), rs in runs.items() if g in ("s_batch", "s_table", "e_sat") for r in rs]
+if all_sat:
+    idle = col(all_sat, lambda r: num(r, "run", "idle_fraction") * 100)
+    gen = col(all_sat, lambda r: num(r, "all", "pkts_rx") / max(num(r, "run", "real_time_s"), 1e-9) / 1e6)
+    w(f"  the loop idle (waiting for packets): {fmt(idle, 0)} % of the time; the generator delivers {fmt(gen, 2)} "
+      f"Mpps; speed_valid in {sum(num(r, 'run', 'speed_valid') == 1 for r in all_sat)}/{len(all_sat)} runs")
+# the table size: the autotuner's table (batch 64 runs) against a table sized for the service
+trows = []
+for svc, var, slots in [("video", "b1024", 1024 * 8), ("web", "b8192", 8192 * 8)]:
+    big, small = runs.get(("s_batch", svc, "b64"), []), runs.get(("s_table", svc, var), [])
+    if not (big and small):
+        continue
+    for rs, label in [(big, None), (small, f"{slots:,}")]:
+        if label is None:      # the autotuner's slots: ft_buckets x bucket_size, from params.txt (run_e4.sh)
+            try:
+                with open(f"{OUT}/params.txt") as f:
+                    p = dict(kv.split("=", 1) for kv in f.read().strip().split(",") if "=" in kv)
+                label = f"{int(p['ft_buckets']) * int(p.get('bucket_size', 8)):,} (autotuner)"
+            except (OSError, KeyError, ValueError):
+                label = "autotuner"
+        trows.append([svc, label, texnum(fmt(col(rs, lambda r: num(r, "run", "peak_memory") / 1e6), 1)),
+                      texnum(fmt(col(rs, lambda r: num(r, "run", "raw_pps") / 1e6), 2))])
+if trows:
+    tex_table("Packet rate with the autotuner's table and with a table sized for the service (saturation mode, "
+              "batch 64, 2-minute traces, median [min, max] over 5 seeds). No insert failed and no flow broke in "
+              "these runs.", "tab:e4-tablesize", ["Service", "Table (slots)", "Peak memory (MB)", "Mpps"], trows,
+              "llrr")
 w()
 
 # ---- events ----
@@ -295,23 +333,36 @@ for var, label in [("events", "with its events"), ("events_coalesce", "with them
     calls = col(rs, lambda r: num(r, "on_event", "calls"))
     on_ev = col(rs, lambda r: num(r, "on_event", "time_ns") / 1e6)
     hsh = col(rs, lambda r: num(r, "hash", "time_ns") / 1e6)
-    real = col(rs, lambda r: num(r, "run", "real_time_s") * 1e3)
+    both = col(rs, lambda r: (num(r, "on_event", "time_ns") + num(r, "hash", "time_ns")) / 1e6)
+    busy = col(rs, lambda r: num(r, "run", "lb_busy_s") * 1e3)
     per = col(rs, lambda r: num(r, "on_event", "time_ns") / max(num(r, "on_event", "calls"), 1) / 1e3)
-    events_rows[var] = (pps, calls, on_ev, hsh, real, per)
+    batch = col(rs, lambda r: num(r, "hash", "pkts") / max(num(r, "hash", "calls"), 1))
+    events_rows[var] = (pps, calls, on_ev, hsh, both, per)
     w(f"  {label:22} {fmt(pps, 2)} Mpps; events {fmt(calls)}; on_event {fmt(on_ev, 1)} ms ({fmt(per, 1)} us each); "
-      f"hash stage {fmt(hsh, 1)} ms; run {fmt(real, 0)} ms")
+      f"hash stage {fmt(hsh, 1)} ms; both {fmt(both, 1)} ms; loop busy {fmt(busy, 0)} ms; "
+      f"{fmt(batch, 1)} packets per hash call")
+if "events_none" in events_rows:
+    base = events_rows["events_none"][4][0]
+    for var, label in [("events", "with its events"), ("events_coalesce", "with them, coalesced")]:
+        if var in events_rows:
+            extra = events_rows[var][4][0] - base
+            n = max(events_rows[var][1][0], 1)
+            w(f"  {label}: on_event + hash {extra:.1f} ms above the run without events, {extra / n * 1e3:.1f} us "
+              f"per event (medians)")
 if events_rows:
     rows_t = []
     for var, label in [("events", "with its events"), ("events_coalesce", "same, coalesced"),
                        ("events_none", "without them")]:
         if var in events_rows:
-            pps, calls, on_ev, hsh, real, per = events_rows[var]
-            rows_t.append([label, texnum(fmt(calls)), texnum(fmt(on_ev, 1)), texnum(fmt(hsh, 1)),
-                           texnum(fmt(real, 0)), texnum(fmt(pps, 2))])
+            pps, calls, on_ev, hsh, both, per = events_rows[var]
+            rows_t.append([label, texnum(fmt(on_ev, 1)), texnum(fmt(hsh, 1)), texnum(fmt(both, 1)),
+                           texnum(fmt(pps, 2))])
+    n_ev = events_rows.get("events", events_rows.get("events_coalesce"))
+    n_ev = f"; the runs with events have {fmt(n_ev[1])} of them" if n_ev else ""
     tex_table("Event cost on \\texttt{events.scn} (saturation mode, \\texttt{profile=1}, median [min, max] over 5 "
-              "seeds): time in \\texttt{on\\_event}, in the hash stage (where coalesced events are applied), and "
-              "the whole run after the warm-up.", "tab:e4-events",
-              ["events.scn", "Events", "on\\_event (ms)", "hash (ms)", "Run (ms)", "Mpps"], rows_t, "lrrrrr")
+              "seeds): time in \\texttt{on\\_event}, in the hash stage (where coalesced events are applied), and in "
+              f"both{n_ev}.", "tab:e4-events",
+              ["events.scn", "on\\_event (ms)", "hash (ms)", "Both (ms)", "Mpps"], rows_t, "lrrrr")
 w()
 
 # ---- paced ----
@@ -321,31 +372,51 @@ for (g, svc, var), rs in runs.items():
         b, load = var[1:].split("l")
         paced[(svc, int(b), load)] = rs
 if paced:
-    w("Paced mode: latency median / p99 (us) and RX drops (% of packets), at 50, 80, 95 % of the saturation rate.")
+    # only the runs the harness validated (pace_valid = 1): in the others its generator fell behind the schedule
+    w("Paced mode, valid runs only (pace_valid = 1): latency median / p99 (us) and RX drops (% of packets), at 50, 80, 95 %")
+    w("of the saturation rate; n = valid runs of 5.")
     prows = []
     for svc in SERVICES:
         for b in BATCHES:
-            cells = []
+            cells, tcells, any_ok = [], [], False
             for load in LOADS:
                 rs = paced.get((svc, b, load), [])
-                if not rs:
-                    cells.append("-")
+                ok = [r for r in rs if num(r, "run", "pace_valid") == 1]
+                if not ok:
+                    cells.append(f"no valid run of {len(rs)}" if rs else "-")
+                    tcells.append("--")
                     continue
-                med = col(rs, lambda r: num(r, "run", "latency_median_ns") / 1e3)
-                p99 = col(rs, lambda r: num(r, "run", "latency_p99_ns") / 1e3)
-                drop = col(rs, lambda r: 100 * num(r, "all", "pkts_ring_dropped") / max(num(r, "all", "pkts_rx"), 1))
-                ok = sum(num(r, "run", "pace_valid") == 1 for r in rs)
-                cells.append(f"{fmt(med, 1)} / {fmt(p99, 1)} us, drops {fmt(drop, 3)} %"
-                             + ("" if ok == len(rs) else f" (pace_valid {ok}/{len(rs)})"))
+                any_ok = True
+                med = col(ok, lambda r: num(r, "run", "latency_median_ns") / 1e3)
+                p99 = col(ok, lambda r: num(r, "run", "latency_p99_ns") / 1e3)
+                drop = col(ok, lambda r: 100 * num(r, "all", "pkts_ring_dropped") / max(num(r, "all", "pkts_rx"), 1))
+                cells.append(f"{fmt(med, 1)} / {fmt(p99, 0)} us, drops {fmt(drop, 2)} % (n={len(ok)})")
+                tcells.append(f"{med[0]:.1f} / {p99[0]:.0f} ({len(ok)})")
             w(f"  {svc:6} batch {b:2}: " + " | ".join(cells))
+            if any_ok:
+                prows.append([svc, str(b)] + tcells)
     for var in ("events", "events_coalesce", "events_none"):
         for load in LOADS:
             rs = [r for k, v in runs.items() if k[0] == "pe" and k[1] == var and k[2] == f"l{load}" for r in v]
             if rs:
-                med = col(rs, lambda r: num(r, "run", "latency_median_ns") / 1e3)
-                p99 = col(rs, lambda r: num(r, "run", "latency_p99_ns") / 1e3)
-                drop = col(rs, lambda r: 100 * num(r, "all", "pkts_ring_dropped") / max(num(r, "all", "pkts_rx"), 1))
-                w(f"  {var:12} load {load}: median {fmt(med, 1)} us, p99 {fmt(p99, 1)} us, drops {fmt(drop, 3)} %")
+                ok = [r for r in rs if num(r, "run", "pace_valid") == 1]
+                if not ok:
+                    w(f"  {var:16} load {load}: no valid run of {len(rs)}")
+                    continue
+                med = col(ok, lambda r: num(r, "run", "latency_median_ns") / 1e3)
+                p99 = col(ok, lambda r: num(r, "run", "latency_p99_ns") / 1e3)
+                w(f"  {var:16} load {load}: median {fmt(med, 1)} us, p99 {fmt(p99, 0)} us (n={len(ok)})")
+    allp = [r for k, v in runs.items() if k[0] in ("p", "pe") for r in v]
+    if allp:
+        okp = [r for r in allp if num(r, "run", "pace_valid") == 1]
+        lag = lambda rs: col(rs, lambda r: num(r, "run", "pace_lag_p99_ns") / 1e3)
+        w(f"  pace_valid in {len(okp)}/{len(allp)} runs; generator's p99 lag behind the schedule: valid runs "
+          f"{fmt(lag(okp), 0) if okp else '-'} us, the others {fmt(lag([r for r in allp if r not in okp]), 0)} us")
+    if prows:
+        tex_table("Paced mode, runs the harness validated only (\\texttt{pace\\_valid} = 1): median / p99 latency "
+                  "in $\\mu$s, median over the valid runs, with their number out of 5 in parentheses. Chat and "
+                  "\\texttt{events.scn} have no valid run.", "tab:e4-paced",
+                  ["Service", "Batch", "50\\,\\%", "80\\,\\%", "95\\,\\%"], prows, "llccc")
     w()
 
 try:
@@ -449,7 +520,7 @@ if paced:
             for i, key in enumerate(("latency_median_ns", "latency_p99_ns")):
                 xs, ys = [], []
                 for load in LOADS:
-                    rs = paced.get((svc, b, load), [])
+                    rs = [r for r in paced.get((svc, b, load), []) if num(r, "run", "pace_valid") == 1]
                     if rs:
                         xs.append(float(load))
                         ys.append(statistics.median(num(r, "run", key) / 1e3 for r in rs))
