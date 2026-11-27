@@ -16,6 +16,7 @@ static int is_in_path(dfs_state_t *path, int depth, uint32_t bucket_index);
 static int ft_cuuko_DFS(flow_table_t *ft, dfs_state_t *path, uint32_t bucket_index, uint32_t depth, int *path_depth, uint32_t *free_bucket, uint32_t *free_slot, uint64_t current_time, int *budget);
 static void get_bucket_indices(const flow_table_t *ft, uint64_t hash, uint32_t *bucket1, uint32_t *bucket2);
 static int is_expired(const flow_table_t *ft,const flow_entry_t *entry,uint64_t current_time);
+static uint64_t next_random(flow_table_t *ft);
 
 /* ---- the cuckoo index: slots ---- */
 
@@ -64,12 +65,18 @@ static inline flow_entry_t *slot_entry(const flow_table_t *ft, uint32_t slot) {
 static inline uint32_t entry_alloc(flow_table_t *ft) {
     uint32_t idx = ft->free_head;
     ft->free_head = ft->entries[idx].replica;
+#if FT_STATS
+    ft->stats.occupied_slots++;
+#endif
     return idx;
 }
 
 static inline void entry_free(flow_table_t *ft, uint32_t idx) {
     ft->entries[idx].replica = ft->free_head;
     ft->free_head = idx;
+#if FT_STATS
+    ft->stats.occupied_slots--;
+#endif
 }
 
 /* Empties a slot, returning its entry (if any) to the free list */
@@ -119,6 +126,8 @@ flow_table_t *ft_init(gen_t *g, uint32_t num_buckets, uint32_t bucket_size, uint
     ft->seed = seed;
     ft->capacity = (uint32_t)capacity;
     ft->sig_bits = sig_bits;
+    ft->insert_policy = 0;
+    ft->rng_state = seed ? seed : 1;
     memset(&ft->stats, 0, sizeof ft->stats);
     ft->timeouts = timeouts;
     // 64-byte aligned, so that a bucket of 16 slots is exactly one cache line
@@ -257,12 +266,21 @@ int ft_insert(flow_table_t *ft, const flow_key_t *key, uint32_t replica, uint8_t
 int ft_insert_at(flow_table_t *ft, const flow_key_t *key, uint32_t replica, uint8_t state, const ft_loc_t *loc,
                  uint32_t service_id, uint64_t current_time){
 
+#if FT_STATS
+    uint32_t load_index =
+        ((uint64_t)ft->stats.occupied_slots * 10) / ft->capacity;
+
+    if (load_index >= 10)
+        load_index = 9;
+#endif
     const uint32_t *buckets = loc->bucket;
     uint32_t sig = loc->sig;
 
     //the key already stored (live or expired): update its entry in place, never store it twice
     //otherwise remember the first empty slot, bucket1 first (the index alone tells it, no entry is read)
     uint32_t *target = NULL;
+    uint32_t *first_empty[2] = {NULL, NULL};
+    uint32_t occupied[2] = {0, 0};
     for(int b = 0; b < 2; b++)
     {
         uint32_t *bucket = bucket_at(ft, buckets[b]);
@@ -271,10 +289,13 @@ int ft_insert_at(flow_table_t *ft, const flow_key_t *key, uint32_t replica, uint
             uint32_t s = bucket[i];
             if(s == 0)
             {
-                if(!target)
-                    target = &bucket[i];
+                if(!first_empty[b])
+                    first_empty[b] = &bucket[i];
+
                 continue;
             }
+
+            occupied[b]++;
             if(slot_sig(ft, s) != sig)
                 continue;
             flow_entry_t *e = slot_entry(ft, s);
@@ -287,19 +308,51 @@ int ft_insert_at(flow_table_t *ft, const flow_key_t *key, uint32_t replica, uint
     }
 
     //no empty slot: a slot whose entry has expired (this reads the entries of the two buckets)
+    // Select an empty slot according to the insertion policy
+    if(first_empty[0] && first_empty[1])
+    {
+        if(ft->insert_policy == 1)
+        {
+            // Least loaded
+            if(occupied[0] <= occupied[1])
+                target = first_empty[0];
+            else
+                target = first_empty[1];
+        }
+        else if(ft->insert_policy == 2)
+        {
+            // Random
+            target = first_empty[next_random(ft) % 2];
+        }
+        else
+        {
+            // First available
+            target = first_empty[0];
+        }
+    }
+    else if(first_empty[0])
+    {
+        target = first_empty[0];
+    }
+    else if(first_empty[1])
+    {
+        target = first_empty[1];
+    }
+
+    
     for(int b = 0; b < 2 && !target; b++)
     {
         int i = find_expired_slot(ft, buckets[b], current_time);
         if(i >= 0)
             target = &bucket_at(ft, buckets[b])[i];
     }
-
+    int path_depth = 0;
     if(!target)
     {
         //both buckets full of live entries: displace slots (cuckoo), within a bounded search
         dfs_state_t path[ft->max_depth];
 
-        int path_depth = 0;
+        
         uint32_t free_bucket = 0;
         uint32_t free_slot = 0;
         int budget = ft->dfs_budget;
@@ -310,8 +363,15 @@ int ft_insert_at(flow_table_t *ft, const flow_key_t *key, uint32_t replica, uint
             found = ft_cuuko_DFS(ft, path, buckets[1], 0, &path_depth, &free_bucket, &free_slot, current_time, &budget);
         }
 
-        if (!found)
+        if (!found){
+#if FT_STATS
+            if(ft->stats.first_failure_seen == 0){
+                ft->stats.first_failure_occupied = ft->stats.occupied_slots;
+                ft->stats.first_failure_seen = 1;
+            }
+#endif
             return 0;
+        }
 
         //the free slot found may hold an expired entry: free it before a slot is moved onto it
         slot_release(ft, &bucket_at(ft, free_bucket)[free_slot]);
@@ -337,11 +397,28 @@ int ft_insert_at(flow_table_t *ft, const flow_key_t *key, uint32_t replica, uint
     uint32_t idx = entry_alloc(ft);
     write_entry(&ft->entries[idx], key, replica, state, service_id, current_time);
     *target = make_slot(ft, sig, idx);
+
+#if FT_STATS
+    ft->stats.insertions_by_load[load_index]++;
+    ft->stats.displacements_by_load[load_index] += path_depth;
+#endif
     return 1;
 }
 
 
 /* ---- internal functions ---- */
+
+static uint64_t next_random(flow_table_t *ft)
+{
+    uint64_t x = ft->rng_state;
+
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+
+    ft->rng_state = x;
+    return x;
+}
 /*
 Function to check if an entry has expired
 Param:

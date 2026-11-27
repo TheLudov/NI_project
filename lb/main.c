@@ -229,6 +229,7 @@ static lb_t *init(gen_t *g, const gen_config_t *cfg)
     uint32_t dfs = (uint32_t)param_ul(g, "dfs_budget", 64, 2, 100000);
     // signature width: 0 = every bit the entry index leaves free
     uint8_t sb = (uint8_t)param_ul(g, "sig_bits", 0, 0, FT_MAX_SIG_BITS);
+    uint8_t ip = (uint8_t)param_ul(g, "insert_policy", 0, 0, 2);
 
     init_timeouts(g, lb);
 
@@ -238,6 +239,7 @@ static lb_t *init(gen_t *g, const gen_config_t *cfg)
     if (!lb->ft) {
         init_fail("flow table initialization failed");
     }
+    lb->ft->insert_policy = ip;
 
     /* Prefetching (E1, Atieh): off unless the params turn it on, so that it can be measured on and off */
     lb->pf_pkt = (uint8_t)param_ul(g, "pf_pkt", 0, 0, 1);
@@ -818,6 +820,47 @@ int main(int argc, char **argv)
             ft->sig_bits, ft->num_buckets, ft->bucket_size, ft->capacity, (unsigned long long)used,
             (unsigned long long)st->lookups, (unsigned long long)st->hits, (unsigned long long)st->slots_checked,
             (unsigned long long)st->sig_matches, (unsigned long long)st->false_matches);
+
+    fprintf(stderr, "\n--- E1 statistics ---\n");
+
+    fprintf(stderr, "Occupied slots: %u / %u\n",
+            st->occupied_slots, ft->capacity);
+
+    if (st->first_failure_seen)
+    {
+        double load_factor =
+            100.0 * st->first_failure_occupied / ft->capacity;
+
+        fprintf(stderr, "First failure occupied: %u\n",
+                st->first_failure_occupied);
+
+        fprintf(stderr, "First failure load factor: %.2f%%\n",
+                load_factor);
+    }
+    else
+    {
+        fprintf(stderr, "No insertion failure\n");
+    }
+
+    fprintf(stderr, "\nLoad range,Insertions,Displacements,Average\n");
+
+    for (int i = 0; i < 10; i++)
+    {
+        double average = 0.0;
+
+        if (st->insertions_by_load[i] > 0)
+        {
+            average = (double)st->displacements_by_load[i]
+                    / st->insertions_by_load[i];
+        }
+
+        fprintf(stderr, "%d-%d%%,%llu,%llu,%.6f\n",
+                i * 10,
+                (i + 1) * 10,
+                (unsigned long long)st->insertions_by_load[i],
+                (unsigned long long)st->displacements_by_load[i],
+                average);
+    }
 #endif
 #if E3_STATS
     e3_report(&e3, lb);

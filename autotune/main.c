@@ -12,6 +12,10 @@
 #include "flow_table.h"
 #include "tabhash.h"
 
+#ifndef E1_LOOKUP_BENCH
+#define E1_LOOKUP_BENCH 0
+#endif
+
 /* ---- tunables of the tuner ---- */
 
 #define RESERVE_BYTES  (2u << 20)  /* the LB's other state: rings (~1.7 MB at ring_v=1000), tabulation tables 26 KB */
@@ -166,8 +170,190 @@ typedef struct {
     double t_hit, t_miss, t_ins, t_over, f_over, cost;
 } cand_t;
 
+
+#if E1_LOOKUP_BENCH
+
+static int benchmark_lookup_cost(void)
+{
+    const uint32_t sizes[] = {
+        256, 1024, 4096, 16384, 65536, 98304
+    };
+
+    gen_t *g = gen_open(
+        NULL,
+        "mode=bench,results=/dev/null,pool_mb=8,bench_keys=1k",
+        &bench_ops
+    );
+
+    if (!g)
+        return 1;
+
+    tabhash_t *th = malloc(sizeof *th);
+
+    tkey_t *keys = malloc(
+        (550502 + N_LOOKUP) * sizeof *keys
+    );
+
+    tkey_t *hitk = malloc(
+        N_LOOKUP * sizeof *hitk
+    );
+
+    if (!th || !keys || !hitk) {
+        fprintf(stderr, "Allocation failed\n");
+        free(th);
+        free(keys);
+        free(hitk);
+        gen_close(g);
+        return 1;
+    }
+
+    double hits[LEN(sizes)][REPS];
+    double misses[LEN(sizes)][REPS];
+
+    volatile uintptr_t sink = 0;
+
+    for (int r = 0; r < REPS; r++) {
+
+        tabhash_init(th, 1000 + r);
+
+        make_keys(
+            keys, 550502 + N_LOOKUP, 2000 + r, th
+        );
+
+        for (size_t j = 0; j < LEN(sizes); j++) {
+
+            size_t c = (j + r) % LEN(sizes);
+
+            uint32_t nb = sizes[c];
+            uint32_t capacity = nb * 8;
+            uint32_t target = capacity * 7 / 10;
+
+            flow_table_t *ft = ft_init(
+                g, nb, 8, 2, 64, 12,
+                HASH_TAB, th, r + 1, NEVER_EXPIRE
+            );
+
+            if (!ft) {
+                fprintf(stderr, "ft_init failed\n");
+                goto fail;
+            }
+
+            ft->insert_policy = 1;
+
+            /* Fill the table to 70%. */
+            for (uint32_t i = 0; i < target; i++) {
+                if (!ft_insert(
+                    ft, &keys[i].key, 0, 1,
+                    keys[i].hash, 0, 0
+                )) {
+                    fprintf(stderr, "Insertion failed\n");
+                    ft_free(g, ft);
+                    goto fail;
+                }
+            }
+
+            /* Prepare random successful lookups. */
+            rng_state = 3000 + r;
+
+            for (uint32_t i = 0; i < N_LOOKUP; i++)
+                hitk[i] = keys[rnd64() % target];
+
+            /* Validate and warm up hits. */
+            for (uint32_t i = 0; i < N_LOOKUP; i++) {
+                if (!ft_find(
+                    ft, &hitk[i].key, hitk[i].hash, 0
+                )) {
+                    fprintf(stderr, "Unexpected miss\n");
+                    ft_free(g, ft);
+                    goto fail;
+                }
+            }
+
+            /* Measure hits. */
+            double t0 = now_ns();
+
+            for (uint32_t i = 0; i < N_LOOKUP; i++) {
+                sink += (uintptr_t)ft_find(
+                    ft, &hitk[i].key, hitk[i].hash, 0
+                );
+            }
+
+            hits[c][r] = (now_ns() - t0) / N_LOOKUP;
+
+            /* Validate and warm up misses. */
+            for (uint32_t i = 0; i < N_LOOKUP; i++) {
+                const tkey_t *k = &keys[550502 + i];
+
+                if (ft_find(ft, &k->key, k->hash, 0)) {
+                    fprintf(stderr, "Unexpected hit\n");
+                    ft_free(g, ft);
+                    goto fail;
+                }
+            }
+
+            /* Measure misses. */
+            t0 = now_ns();
+
+            for (uint32_t i = 0; i < N_LOOKUP; i++) {
+                const tkey_t *k = &keys[550502 + i];
+
+                sink += (uintptr_t)ft_find(
+                    ft, &k->key, k->hash, 0
+                );
+            }
+
+            misses[c][r] = (now_ns() - t0) / N_LOOKUP;
+
+            fprintf(stderr,
+                "Rep=%d Buckets=%u Hit=%.2f Miss=%.2f\n",
+                r + 1, nb, hits[c][r], misses[c][r]
+            );
+
+            ft_free(g, ft);
+        }
+    }
+
+    /* CSV results. */
+    printf("buckets,capacity,memory_bytes,"
+           "load_factor,hit_ns,miss_ns\n");
+
+    for (size_t c = 0; c < LEN(sizes); c++) {
+
+        uint32_t capacity = sizes[c] * 8;
+
+        printf("%u,%u,%zu,%.6f,%.3f,%.3f\n",
+            sizes[c],
+            capacity,
+            (size_t)capacity * SLOT_BYTES,
+            (double)(capacity * 7 / 10) / capacity,
+            median(hits[c], REPS),
+            median(misses[c], REPS)
+        );
+    }
+
+    free(th);
+    free(keys);
+    free(hitk);
+    gen_close(g);
+
+    return 0;
+
+fail:
+    free(th);
+    free(keys);
+    free(hitk);
+    gen_close(g);
+
+    return 1;
+}
+
+#endif
+
 int main(void)
 {
+#if E1_LOOKUP_BENCH
+    return benchmark_lookup_cost();
+#endif
     gen_t *g = gen_open(NULL, "mode=bench,results=/dev/null,pool_mb=8,bench_keys=1k", &bench_ops);
     if (!g) {
         fprintf(stderr, "autotune: gen_open failed\n");

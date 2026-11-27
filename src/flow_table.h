@@ -37,6 +37,12 @@ typedef struct {
     uint64_t slots_checked; // non-empty slots whose signature was compared with the key's
     uint64_t sig_matches; // of those, same signature: the entry array was read
     uint64_t false_matches; // of those, another flow's key (signature collision)
+    uint32_t occupied_slots; //actual number of occupied slots in the flow table
+    uint32_t first_failure_occupied; //number of occupied slots when the first insertion failure occurs
+    uint8_t first_failure_seen; //flag to indicate if the first insertion failure has been seen
+
+    uint64_t insertions_by_load[10]; //number of insertions at different load levels (0-9)
+    uint64_t displacements_by_load[10]; //number of displacements at different load levels (0-9)
 } ft_stats_t;
 
 //struct to represent a flow entry in the flow table (one element of the entry array)
@@ -70,7 +76,10 @@ typedef struct {
     uint64_t seed; // seed for initializing the hash tables
     ft_stats_t stats; // ft_find's counters (stay 0 when FT_STATS is 0)
     const svc_timeouts_t *timeouts; // pointer to the service timeouts (lb/main.c)
+    uint8_t insert_policy; // insertion policy: 0 for First available, 1 for least loaded, 2 for random
+    uint64_t rng_state; // state of the random number generator for the random insertion policy
 }flow_table_t;
+
 
 
 
