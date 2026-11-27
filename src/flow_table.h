@@ -157,5 +157,11 @@ void ft_prefetch_buckets(const flow_table_t *ft, const ft_loc_t *loc, int both);
    ft_prefetch_buckets has brought them in. */
 void ft_prefetch_entries(const flow_table_t *ft, const ft_loc_t *loc, int both);
 
+/* E5 occupancy probe (Ludovic), measurement only: walks the whole index (slow: never call it in a timed run).
+   live[3 * s + state] receives the live entries of service s in each state (FS_HALF_OPEN, FS_ESTABLISHED,
+   FS_CLOSING), for s < n_svc (at most FT_OCC_MAX_SVC); *expired the entries still in the index whose timeout has
+   passed at now (not yet reclaimed: an insert or a lookup frees them lazily). */
+#define FT_OCC_MAX_SVC 16
+void ft_occupancy(const flow_table_t *ft, uint64_t now, uint32_t n_svc, uint64_t *live, uint64_t *expired);
 
 #endif // FLOW_TABLE_H

@@ -71,6 +71,23 @@ struct lb {
 #if E4_STATS
     uint64_t e4_evict[16]; /* evictions per service (E4_STATS builds only) */
 #endif
+    /* E5, SYN-flood defence: syn_insert=1 (default) stores a half-open entry for every SYN; syn_insert=0 forwards a
+       SYN by consistent hashing without storing it. The flow's next packet (the ACK) then misses, consistent
+       hashing gives it the same replica (same hash, same ring), and it is stored established. Spoofed SYNs that
+       are never completed thus take no slot of the shared table. */
+    uint8_t syn_insert;
+    /* E5, adaptive variant: syn_guard=R (SYNs per second, 0 = off) lets each service store at most R/10 SYNs per
+       100 ms window of trace time; the service's further SYNs in that window are forwarded without an entry, as
+       with syn_insert=0. Normal traffic stays below the limit (web opens ~10k flows/s), so only a flooded service
+       goes stateless, and only during the flood: a replica event between a SYN and its ACK then cannot break the
+       other services' flows. */
+    uint32_t syn_guard_win;     /* SYNs a service may store per window (0: no guard) */
+    uint64_t *guard_start;      /* per service: start of its current window (trace ns) */
+    uint32_t *guard_count;      /* per service: SYNs stored in it */
+    /* E5, occupancy probe (measurement only): every occ_every_s seconds of trace time, the live entries per
+       service and state are appended to occ_file. 0: off. */
+    uint64_t occ_every_ns, occ_next_ns;
+    FILE *occ;
 };
 
 /* pf_pkt (Atieh): the 54 bytes of Ethernet + IPv4 + TCP headers from off, which may span two cache lines */
@@ -239,6 +256,22 @@ static lb_t *init(gen_t *g, const gen_config_t *cfg)
             lb->fallback[k] = (uint8_t)param_ul(g, key, fb, 0, 3);
         }
     }
+
+    /* E5 (Ludovic): SYN-flood defence and occupancy probe, see struct lb */
+    lb->syn_insert = (uint8_t)param_ul(g, "syn_insert", 1, 0, 1);
+    unsigned long guard = param_ul(g, "syn_guard", 0, 0, 100000000);
+    lb->syn_guard_win = (uint32_t)((guard + 9) / 10);
+    if (lb->syn_guard_win) {
+        uint32_t n = cfg->n_services ? cfg->n_services : 1;
+        lb->guard_start = gen_alloc(g, n * sizeof *lb->guard_start, 0, 0);
+        lb->guard_count = gen_alloc(g, n * sizeof *lb->guard_count, 0, 0);
+        if (!lb->guard_start || !lb->guard_count)
+            init_fail("gen_alloc for the SYN guard failed");
+        memset(lb->guard_start, 0, n * sizeof *lb->guard_start);
+        memset(lb->guard_count, 0, n * sizeof *lb->guard_count);
+    }
+    lb->occ_every_ns = param_ul(g, "occ_every_s", 0, 0, 86400) * 1000000000ull;
+    lb->occ = NULL;
     return lb;
 }
 
@@ -672,6 +705,21 @@ int main(int argc, char **argv)
     static e4_t e4;
     e4.sec_end = 1000000000ull;
 #endif
+
+    /* E5 occupancy probe: opened here, for the main instance only (init also runs for the harness's copy) */
+    uint32_t nsvc = lb->cfg.n_services;
+    uint64_t occ_live[FT_OCC_MAX_SVC * 3];
+    if (lb->occ_every_ns) {
+        const char *path = gen_param(g, "occ_file");
+        lb->occ = fopen(path ? path : "occupancy.csv", "w");
+        if (!lb->occ || nsvc > FT_OCC_MAX_SVC) {
+            fprintf(stderr, "occ: cannot open the occupancy file, or too many services\n");
+            return 1;
+        }
+        fprintf(lb->occ, "t_s,service,half_open,established,closing,expired,capacity\n");
+        lb->occ_next_ns = lb->occ_every_ns;
+    }
+
     while (gen_running(g)) {
         /* Tunnelled replies (bonus, web_tunnel=1) are not handled: drop whatever reaches the internal NIC. */
         uint8_t m = gen_rx_batch(g, GEN_NIC_INT, p, 64);
@@ -691,11 +739,31 @@ int main(int argc, char **argv)
         }
         uint64_t hit = gen_lookup(g, lb, p, n, s, ok);
         uint64_t got = gen_replica(g, lb, p, n, s, ok & ~hit);
+        uint64_t to_store = got;
+        if (!lb->syn_insert || lb->syn_guard_win) {             /* E5 defence: SYNs forwarded, not stored */
+            for (uint8_t i = 0; i < n; i++) {
+                if (!(got & (1ull << i)) || s[i].key.protocol != 6 || !is_syn(s[i].tcp_flags))
+                    continue;
+                if (lb->syn_insert) {                           /* syn_guard: within the service's quota? */
+                    uint32_t k = s[i].service_id;
+                    uint64_t now = p[i]->ts_ns;
+                    if (now - lb->guard_start[k] >= 100 * MS) {
+                        lb->guard_start[k] = now;
+                        lb->guard_count[k] = 0;
+                    }
+                    if (lb->guard_count[k] < lb->syn_guard_win) {
+                        lb->guard_count[k]++;
+                        continue;                               /* stored */
+                    }
+                }
+                to_store &= ~(1ull << i);
+            }
+        }
 #if E4_STATS
-        uint64_t stored = gen_insert(g, lb, p, n, s, got);      /* sent even if the insert fails */
+        uint64_t stored = gen_insert(g, lb, p, n, s, to_store); /* sent even if the insert fails */
         e4_count(&e4, lb, p, n, s, ok & ~hit, got, stored);
 #else
-        gen_insert(g, lb, p, n, s, got);                        /* sent even if the insert fails */
+        gen_insert(g, lb, p, n, s, to_store);                   /* sent even if the insert fails */
 #endif
         uint64_t send = hit | got;
 #if E3_STATS
@@ -720,7 +788,23 @@ int main(int argc, char **argv)
                 encap(lb, p[i], s[i].replica);
         gen_tx_batch(g, GEN_NIC_INT, p, n, send);
         gen_drop(g, p, n, all & ~send);
+
+        if (lb->occ) {
+            uint64_t now = p[n - 1]->ts_ns;
+            while (now >= lb->occ_next_ns) {
+                uint64_t expired = 0;
+                ft_occupancy(lb->ft, now, nsvc, occ_live, &expired);
+                for (uint32_t k = 0; k < nsvc; k++)
+                    fprintf(lb->occ, "%.0f,%u,%llu,%llu,%llu,%llu,%u\n", lb->occ_next_ns / 1e9, k,
+                            (unsigned long long)occ_live[3 * k], (unsigned long long)occ_live[3 * k + 1],
+                            (unsigned long long)occ_live[3 * k + 2], (unsigned long long)(k == 0 ? expired : 0),
+                            lb->ft->capacity);
+                lb->occ_next_ns += lb->occ_every_ns;
+            }
+        }
     }
+    if (lb->occ)
+        fclose(lb->occ);
 #if FT_STATS
     /* E1: the main LB's flow-table counters, raw, on one line of stderr (key=value), with the table's layout and
        its occupancy at the end. scripts/tests_ft/false_matches.sh parses it and compares with the theory. */

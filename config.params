@@ -1,1 +1,1 @@
-hashfn=tab,ring_v=100,ring_v_198.51.100.10=1000,ring_v_198.51.100.20=1000,to_half_ms=200,to_est_ms=70000,to_fin_ms=2000,to_est_ms_198.51.100.30=30000,sig_bits=0,ins_fallback_198.51.100.30=3,ev_coalesce=1
+hashfn=tab,ring_v=100,ring_v_198.51.100.10=1000,ring_v_198.51.100.20=1000,to_half_ms=200,to_est_ms=70000,to_fin_ms=2000,to_est_ms_198.51.100.30=30000,sig_bits=0,ins_fallback_198.51.100.30=3,ev_coalesce=1,syn_guard=50000,batch=32,pf_bucket=2
